@@ -254,7 +254,15 @@ class StockAnalysisPipeline:
         except Exception as exc:
             logger.warning("搜索服务初始化失败，将以无搜索模式运行: %s", exc, exc_info=True)
             self.search_service = None
-        
+
+        # 初始化链接爬虫新闻服务（可选，失败不阻断主流程）
+        try:
+            from src.services.link_crawler_service import LinkCrawlerService
+            self.link_crawler_service = LinkCrawlerService(config=self.config, db=self.db)
+        except Exception as exc:
+            logger.warning("链接爬虫服务初始化失败，将以无爬虫模式运行: %s", exc, exc_info=True)
+            self.link_crawler_service = None
+
         logger.info(f"调度器初始化完成，最大并发数: {self.max_workers}")
         logger.info("已启用技术分析引擎（均线/趋势/量价指标）")
         # 打印实时行情/筹码配置状态
@@ -624,6 +632,25 @@ class StockAnalysisPipeline:
                             news_context = social_context
                 except Exception as e:
                     logger.warning(f"{stock_name}({code}) Social sentiment fetch failed: {e}")
+
+            # Step 4.6: 链接爬虫新闻（用户配置 URL 实时抓取，合并进新闻上下文）
+            if self.link_crawler_service is not None and self.link_crawler_service.is_available:
+                try:
+                    crawl_context = self.link_crawler_service.fetch_context(
+                        code=code,
+                        stock_name=stock_name,
+                        market=market or "cn",
+                        query_id=query_id,
+                    )
+                    if crawl_context:
+                        news_context = (
+                            f"{news_context}\n\n{crawl_context}"
+                            if news_context
+                            else crawl_context
+                        )
+                        logger.info(f"{stock_name}({code}) 已合并链接爬虫新闻")
+                except Exception as exc:
+                    logger.warning(f"{stock_name}({code}) 链接爬虫新闻获取失败: {exc}")
 
             if persisted_intelligence_context:
                 news_context = (

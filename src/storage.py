@@ -215,6 +215,31 @@ class NewsIntel(Base):
         return f"<NewsIntel(code={self.code}, title={self.title[:20]}...)>"
 
 
+class CrawlNewsItem(Base):
+    """爬虫抓取的新闻条目（用户配置 URL 列表，实时抓取）"""
+    __tablename__ = 'crawl_news_items'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    query_id = Column(String(64), index=True)
+    code = Column(String(10), nullable=False, index=True)
+    name = Column(String(50))
+    source_label = Column(String(100))  # 配置的标签
+    market = Column(String(16), index=True)
+    title = Column(String(300), nullable=False)
+    snippet = Column(Text)
+    url = Column(String(1000), nullable=False)
+    published_date = Column(DateTime, index=True, nullable=True)
+    fetched_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('url', name='uix_crawl_news_url'),
+        Index('ix_crawl_news_code_pub', 'code', 'published_date'),
+    )
+
+    def __repr__(self) -> str:
+        return f"<CrawlNewsItem(code={self.code}, title={self.title[:20]}...)>"
+
+
 class IntelligenceSource(Base):
     """可配置资讯源。"""
 
@@ -3437,6 +3462,51 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 def get_db() -> DatabaseManager:
     """获取数据库管理器实例的快捷方式"""
     return DatabaseManager.get_instance()
+
+
+def save_crawl_news_item(db, **fields) -> bool:
+    """插入爬虫抓取的新闻条目（链接爬虫模块专用）。
+
+    与 save_news_intel 相同的幂等语义：URL 唯一约束冲突（重复）时返回
+    False 并吞掉 IntegrityError；新增成功返回 True。失败一律 fail-open，
+    不向上抛异常，避免影响主分析流程。
+
+    支持两种 db 形态：
+    - DatabaseManager（项目内标准用法，pipeline 传入 self.db）
+    - 已打开的 SQLAlchemy Session（便于测试或调用方自持会话）
+    """
+    if db is None:
+        return False
+    try:
+        if hasattr(db, "_run_write_transaction"):
+            def _write(session: Session) -> bool:
+                session.add(CrawlNewsItem(**fields))
+                return True
+
+            return db._run_write_transaction(
+                f"save_crawl_news_item[{fields.get('code') or ''}]",
+                _write,
+            )
+        # Session 直传路径（测试或调用方已持有会话）
+        db.add(CrawlNewsItem(**fields))
+        db.commit()
+        return True
+    except IntegrityError:
+        try:
+            if hasattr(db, "rollback"):
+                db.rollback()
+        except Exception:
+            pass
+        logger.debug("爬虫新闻条目重复，已跳过: %s", fields.get("url"))
+        return False
+    except Exception as exc:
+        try:
+            if hasattr(db, "rollback"):
+                db.rollback()
+        except Exception:
+            pass
+        logger.warning("保存爬虫新闻条目失败（fail-open）: %s", exc)
+        return False
 
 
 def persist_llm_usage(

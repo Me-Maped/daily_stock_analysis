@@ -837,6 +837,13 @@ class Config:
     newsnow_base_url: str = "https://newsnow.busiyi.world"  # NewsNow HTTP API base URL (数据源侧，不影响 LLM/provider base URL)
     bias_threshold: float = 5.0  # 乖离率阈值（%），超过此值提示不追高
 
+    # === 链接爬虫新闻源配置（用户配置 URL 列表，实时爬取并入 LLM 新闻上下文）===
+    link_crawl_sources: List[str] = field(default_factory=list)  # 格式: 标签|市场|URL，逗号分隔；市场: cn/hk/us/global
+    link_crawl_timeout_sec: float = 10.0  # 单个源拉取超时（秒）
+    link_crawl_max_items_per_source: int = 20  # 单源最多提取条数
+    link_crawl_max_age_hours: int = 48  # 新闻最大时效（小时），超过则丢弃
+    link_crawl_enabled: bool = True  # 显式设为 false 可关闭
+
     # === Agent 模式配置 ===
     agent_backend: str = "auto"
     agent_generation_backend: str = AUTO_AGENT_BACKEND_ID
@@ -1551,6 +1558,8 @@ class Config:
             default=True,
         )
 
+        link_crawl_sources = [s.strip() for s in os.getenv('LINK_CRAWL_SOURCES', '').split(',') if s.strip()]
+
         # 企微消息类型与最大字节数逻辑
         wechat_msg_type = os.getenv('WECHAT_MSG_TYPE', 'markdown')
         wechat_msg_type_lower = wechat_msg_type.lower()
@@ -1741,6 +1750,32 @@ class Config:
             ),
             newsnow_base_url=((os.getenv('NEWSNOW_BASE_URL') or '').strip().rstrip('/') or 'https://newsnow.busiyi.world'),
             bias_threshold=parse_env_float(os.getenv('BIAS_THRESHOLD'), 5.0, field_name='BIAS_THRESHOLD', minimum=1.0),
+            link_crawl_sources=link_crawl_sources,
+            link_crawl_timeout_sec=parse_env_float(
+                os.getenv('LINK_CRAWL_TIMEOUT_SEC'),
+                10.0,
+                field_name='LINK_CRAWL_TIMEOUT_SEC',
+                minimum=1.0,
+                maximum=60.0,
+            ),
+            link_crawl_max_items_per_source=parse_env_int(
+                os.getenv('LINK_CRAWL_MAX_ITEMS_PER_SOURCE'),
+                20,
+                field_name='LINK_CRAWL_MAX_ITEMS_PER_SOURCE',
+                minimum=1,
+                maximum=200,
+            ),
+            link_crawl_max_age_hours=parse_env_int(
+                os.getenv('LINK_CRAWL_MAX_AGE_HOURS'),
+                48,
+                field_name='LINK_CRAWL_MAX_AGE_HOURS',
+                minimum=1,
+                maximum=24 * 30,
+            ),
+            link_crawl_enabled=parse_env_bool(
+                os.getenv('LINK_CRAWL_ENABLED'),
+                default=True,
+            ),
             agent_backend=(os.getenv('AGENT_BACKEND', 'auto') or 'auto').strip().lower(),
             agent_generation_backend=agent_generation_backend,
             agent_litellm_model=agent_litellm_model,
