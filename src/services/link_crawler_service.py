@@ -201,6 +201,8 @@ class LinkCrawlerService:
 
         任何异常都不会向上抛出（fail-open）；零条目或整体失败返回 None。
         """
+        if not self.is_available:
+            return None
         try:
             db = db if db is not None else self.db
             sources = self._applicable_sources(market)
@@ -243,24 +245,42 @@ class LinkCrawlerService:
         self._validate_url(source.url)
         headers = {"User-Agent": _DEFAULT_USER_AGENT}
         session = requests.Session()
-        session.max_redirects = _MAX_REDIRECTS
         response = None
+        current_url = source.url
+        redirect_count = 0
         try:
-            response = session.get(
-                source.url,
-                timeout=self.timeout_sec,
-                headers=headers,
-                proxies=_DISABLE_REQUEST_PROXIES,
-                stream=True,
-            )
+            while True:
+                response = session.get(
+                    current_url,
+                    timeout=self.timeout_sec,
+                    headers=headers,
+                    proxies=_DISABLE_REQUEST_PROXIES,
+                    stream=True,
+                    allow_redirects=False,
+                )
+                if response.status_code not in {301, 302, 303, 307, 308}:
+                    break
+
+                try:
+                    location = (response.headers.get("Location") or "").strip()
+                    if not location:
+                        raise ValueError("重定向响应缺少 Location")
+                    redirect_url = urljoin(current_url, location)
+                    self._validate_url(redirect_url)
+                    redirect_count += 1
+                    if redirect_count > _MAX_REDIRECTS:
+                        raise ValueError("链接爬虫重定向次数超过限制")
+                    current_url = redirect_url
+                finally:
+                    response.close()
+                    response = None
+
             response.raise_for_status()
-            final_url = response.url or source.url
-            self._validate_url(final_url)
             content = self._read_limited_response(response)
             if self._looks_like_feed(content):
                 raw_items = self._parse_feed(content)
             else:
-                raw_items = self._extract_articles(content, base_url=final_url)
+                raw_items = self._extract_articles(content, base_url=current_url)
             return self._select_items(
                 raw_items=raw_items,
                 source=source,
@@ -271,9 +291,11 @@ class LinkCrawlerService:
                 seen_urls=seen_urls,
             )
         finally:
-            session.close()
-            if response is not None:
-                response.close()
+            try:
+                if response is not None:
+                    response.close()
+            finally:
+                session.close()
 
     def _select_items(
         self,

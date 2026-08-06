@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import requests
 
-from src.config import Config
+from src.config import Config, DEFAULT_LINK_CRAWL_SOURCES
 from src.services.link_crawler_service import LinkCrawlerService
 
 # 通用 HTML 页面：含有效新闻链接、相对路径、重复链接与导航/功能垃圾链接
@@ -36,10 +36,18 @@ RSS_FIXTURE = """<?xml version="1.0" encoding="UTF-8"?>
 class _FakeResponse:
     """最小 requests.Response 替身：url / status_code / iter_content / content / close。"""
 
-    def __init__(self, url: str, content: bytes):
+    def __init__(
+        self,
+        url: str,
+        content: bytes = b"",
+        status_code: int = 200,
+        headers=None,
+    ):
         self.url = url
-        self.status_code = 200
+        self.status_code = status_code
+        self.headers = headers or {}
         self._content = content
+        self.closed = False
 
     def raise_for_status(self) -> None:
         return None
@@ -52,7 +60,7 @@ class _FakeResponse:
         return self._content
 
     def close(self) -> None:
-        return None
+        self.closed = True
 
 
 class _FakeSession:
@@ -62,11 +70,16 @@ class _FakeSession:
         self.routes = routes
         self.raise_urls = set(raise_urls or [])
         self.max_redirects = 5
+        self.requested_urls = []
 
     def get(self, url, **kwargs):
+        self.requested_urls.append(url)
         if url in self.raise_urls:
             raise requests.RequestException("boom")
-        return _FakeResponse(url, self.routes[url])
+        route = self.routes[url]
+        if isinstance(route, _FakeResponse):
+            return route
+        return _FakeResponse(url, route)
 
     def close(self) -> None:
         return None
@@ -149,6 +162,18 @@ class ParseSourceTest(LinkCrawlerServiceTestCase):
 
 
 class ApplicableSourcesTest(LinkCrawlerServiceTestCase):
+    def test_default_config_source_is_parsed_and_available_for_a_shares(self) -> None:
+        service = LinkCrawlerService(config=Config(), db=None)
+
+        self.assertEqual(service.sources_raw, list(DEFAULT_LINK_CRAWL_SOURCES))
+        self.assertTrue(service.is_available)
+        self.assertEqual(len(service.parsed_sources), 2)
+        self.assertEqual(service.parsed_sources[0].label, "新浪财经7x24")
+        self.assertEqual(service.parsed_sources[0].market, "cn")
+        self.assertEqual(service.parsed_sources[1].label, "东方财富财经要闻")
+        self.assertEqual(service.parsed_sources[1].market, "cn")
+        self.assertEqual(service._applicable_sources("cn"), service.parsed_sources)
+
     def test_global_matches_any_market(self) -> None:
         service = self._make_service(
             link_crawl_sources=[
@@ -220,6 +245,95 @@ class ValidateUrlTest(LinkCrawlerServiceTestCase):
 
 
 class FetchContextTest(LinkCrawlerServiceTestCase):
+    def test_fetch_context_rejects_private_redirect_before_request(self) -> None:
+        service = self._make_service()
+        source_url = "https://news.example.com/a"
+        private_url = "http://127.0.0.1/private"
+        redirect = _FakeResponse(
+            source_url,
+            status_code=302,
+            headers={"Location": private_url},
+        )
+        fake = _FakeSession({source_url: redirect})
+
+        with patch(
+            "src.services.link_crawler_service.requests.Session", return_value=fake
+        ):
+            text = service.fetch_context(
+                code="600519", stock_name="贵州茅台", market="cn"
+            )
+
+        self.assertIsNone(text)
+        self.assertEqual(fake.requested_urls, [source_url])
+        self.assertTrue(redirect.closed)
+
+    def test_fetch_context_follows_valid_public_redirect(self) -> None:
+        service = self._make_service()
+        source_url = "https://news.example.com/a"
+        redirected_url = "https://news.example.com/feed"
+        redirect = _FakeResponse(
+            source_url,
+            status_code=302,
+            headers={"Location": "/feed"},
+        )
+        fake = _FakeSession(
+            {
+                source_url: redirect,
+                redirected_url: HTML_FIXTURE.encode("utf-8"),
+            }
+        )
+
+        with patch(
+            "src.services.link_crawler_service.requests.Session", return_value=fake
+        ):
+            text = service.fetch_context(
+                code="600519", stock_name="贵州茅台", market="cn"
+            )
+
+        self.assertIsNotNone(text)
+        self.assertIn("央行宣布人工智能板块持续走强", text)
+        self.assertEqual(fake.requested_urls, [source_url, redirected_url])
+        self.assertTrue(redirect.closed)
+
+    def test_fetch_context_enforces_redirect_limit(self) -> None:
+        service = self._make_service()
+        source_url = "https://news.example.com/a"
+        redirect_urls = [f"https://news.example.com/r{i}" for i in range(1, 7)]
+        routes = {
+            source_url: _FakeResponse(
+                source_url, status_code=302, headers={"Location": "/r1"}
+            )
+        }
+        for index, url in enumerate(redirect_urls[:-1]):
+            routes[url] = _FakeResponse(
+                url,
+                status_code=302,
+                headers={"Location": f"/r{index + 2}"},
+            )
+        fake = _FakeSession(routes)
+
+        with patch(
+            "src.services.link_crawler_service.requests.Session", return_value=fake
+        ):
+            text = service.fetch_context(
+                code="600519", stock_name="贵州茅台", market="cn"
+            )
+
+        self.assertIsNone(text)
+        self.assertEqual(fake.requested_urls, [source_url, *redirect_urls[:-1]])
+        self.assertNotIn(redirect_urls[-1], fake.requested_urls)
+
+    def test_fetch_context_disabled_service_makes_no_request(self) -> None:
+        service = self._make_service(link_crawl_enabled=False)
+
+        with self._patch({"https://news.example.com/a": HTML_FIXTURE.encode("utf-8")}) as session:
+            text = service.fetch_context(
+                code="600519", stock_name="贵州茅台", market="cn"
+            )
+
+        self.assertIsNone(text)
+        session.assert_not_called()
+
     def test_fetch_context_end_to_end_formatted(self) -> None:
         service = self._make_service(
             link_crawl_sources=["测试源|cn|https://news.example.com/a"]

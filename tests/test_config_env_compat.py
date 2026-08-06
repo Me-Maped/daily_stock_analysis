@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.config import Config, DEFAULT_ALPHASIFT_INSTALL_SPEC, setup_env
+from src.config import Config, DEFAULT_ALPHASIFT_INSTALL_SPEC, DEFAULT_LINK_CRAWL_SOURCES, setup_env
 
 
 class ConfigEnvCompatibilityTestCase(unittest.TestCase):
@@ -121,6 +121,47 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
             config.realtime_source_priority,
             "tencent,akshare_sina,efinance,akshare_em",
         )
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_link_crawler_defaults_when_env_keys_are_absent(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(os.environ, {"STOCK_LIST": "600519"}, clear=True):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.link_crawl_sources, list(DEFAULT_LINK_CRAWL_SOURCES))
+        self.assertTrue(config.link_crawl_enabled)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_link_crawler_explicit_empty_sources_do_not_use_defaults(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {"STOCK_LIST": "600519", "LINK_CRAWL_SOURCES": ""},
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.link_crawl_sources, [])
+        self.assertTrue(config.link_crawl_enabled)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_link_crawler_explicit_false_disables_crawler(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {"STOCK_LIST": "600519", "LINK_CRAWL_ENABLED": "false"},
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.link_crawl_sources, list(DEFAULT_LINK_CRAWL_SOURCES))
+        self.assertFalse(config.link_crawl_enabled)
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])

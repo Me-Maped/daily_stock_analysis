@@ -817,5 +817,51 @@ class TestMarketReviewFieldsRegistered(unittest.TestCase):
         self.assertIn("MARKET_REVIEW_REGION", field_keys)
 
 
+class TestLinkCrawlerFieldsRegistered(unittest.TestCase):
+    """Link crawler settings must be exposed under Data Source."""
+
+    _KEYS = (
+        "LINK_CRAWL_SOURCES",
+        "LINK_CRAWL_ENABLED",
+        "LINK_CRAWL_TIMEOUT_SEC",
+        "LINK_CRAWL_MAX_ITEMS_PER_SOURCE",
+        "LINK_CRAWL_MAX_AGE_HOURS",
+    )
+
+    def test_field_definitions_expose_types_bounds_and_defaults(self):
+        expected = {
+            "LINK_CRAWL_SOURCES": ("string", "textarea", {}),
+            "LINK_CRAWL_ENABLED": ("boolean", "switch", {}),
+            "LINK_CRAWL_TIMEOUT_SEC": ("number", "number", {"min": 1, "max": 60}),
+            "LINK_CRAWL_MAX_ITEMS_PER_SOURCE": ("integer", "number", {"min": 1, "max": 200}),
+            "LINK_CRAWL_MAX_AGE_HOURS": ("integer", "number", {"min": 1, "max": 720}),
+        }
+        defaults = {
+            "LINK_CRAWL_SOURCES": (
+                "新浪财经7x24|cn|https://finance.sina.com.cn/7x24/,"
+                "东方财富财经要闻|cn|https://finance.eastmoney.com/a/cgnjj.html"
+            ),
+            "LINK_CRAWL_ENABLED": "true",
+            "LINK_CRAWL_TIMEOUT_SEC": "10.0",
+            "LINK_CRAWL_MAX_ITEMS_PER_SOURCE": "20",
+            "LINK_CRAWL_MAX_AGE_HOURS": "48",
+        }
+
+        for key, (data_type, ui_control, validation) in expected.items():
+            field = get_field_definition(key)
+            self.assertEqual(field["category"], "data_source")
+            self.assertEqual(field["data_type"], data_type)
+            self.assertEqual(field["ui_control"], ui_control)
+            self.assertEqual(field["validation"], validation)
+            self.assertEqual(field["default_value"], defaults[key])
+            self.assertNotEqual(field["display_order"], 9000)
+
+    def test_schema_response_groups_all_link_crawler_fields_under_data_source(self):
+        schema = build_schema_response()
+        data_source = next(category for category in schema["categories"] if category["category"] == "data_source")
+        field_keys = {field["key"] for field in data_source["fields"]}
+        self.assertTrue(set(self._KEYS).issubset(field_keys))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -182,6 +182,332 @@ const PROMPT_CACHE_ADVANCED_SETTING_KEYS = new Set([
   'LLM_PROMPT_CACHE_DIAGNOSTICS_LEVEL',
 ]);
 
+const LINK_CRAWL_SETTING_KEYS = new Set([
+  'LINK_CRAWL_SOURCES',
+  'LINK_CRAWL_ENABLED',
+  'LINK_CRAWL_TIMEOUT_SEC',
+  'LINK_CRAWL_MAX_ITEMS_PER_SOURCE',
+  'LINK_CRAWL_MAX_AGE_HOURS',
+]);
+const LINK_CRAWL_MARKETS = ['cn', 'hk', 'us', 'global'] as const;
+
+type LinkCrawlMarket = typeof LINK_CRAWL_MARKETS[number];
+type LinkCrawlSource = {
+  label: string;
+  market: LinkCrawlMarket;
+  url: string;
+};
+
+function isHttpLinkCrawlUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function isCompleteLinkCrawlSource(source: LinkCrawlSource): boolean {
+  return Boolean(source.label.trim()) && isHttpLinkCrawlUrl(source.url.trim());
+}
+
+function parseLinkCrawlSources(value: string): { sources: LinkCrawlSource[]; rawEntries: string[] } {
+  const sources: LinkCrawlSource[] = [];
+  const rawEntries: string[] = [];
+
+  for (const entry of value.split(',')) {
+    if (!entry.trim()) {
+      continue;
+    }
+    const parts = entry.split('|');
+    const label = parts[0]?.trim();
+    const market = parts[1]?.trim().toLowerCase();
+    const url = parts[2]?.trim();
+    if (
+      parts.length !== 3
+      || !label
+      || !url
+      || !LINK_CRAWL_MARKETS.includes(market as LinkCrawlMarket)
+      || !isCompleteLinkCrawlSource({ label, market: market as LinkCrawlMarket, url })
+    ) {
+      rawEntries.push(entry);
+      continue;
+    }
+    sources.push({
+      label,
+      market: market as LinkCrawlMarket,
+      url,
+    });
+  }
+
+  return { sources, rawEntries };
+}
+
+function serializeLinkCrawlSources(sources: LinkCrawlSource[], rawEntries: string[]): string {
+  return [
+    ...sources.map(({ label, market, url }) => `${label.trim()}|${market}|${url.trim()}`),
+    ...rawEntries,
+  ].join(',');
+}
+
+interface LinkCrawlSettingsCardProps {
+  items: SystemConfigItem[];
+  disabled: boolean;
+  issueByKey: Record<string, ConfigValidationIssue[]>;
+  onChange: (key: string, value: string) => void;
+}
+
+function LinkCrawlSettingsCard({
+  items,
+  disabled,
+  issueByKey,
+  onChange,
+}: LinkCrawlSettingsCardProps) {
+  const itemByKey = new Map(items.map((item) => [item.key, item]));
+  const sourcesItem = itemByKey.get('LINK_CRAWL_SOURCES');
+  const enabledItem = itemByKey.get('LINK_CRAWL_ENABLED');
+  const limitItems = [
+    itemByKey.get('LINK_CRAWL_TIMEOUT_SEC'),
+    itemByKey.get('LINK_CRAWL_MAX_ITEMS_PER_SOURCE'),
+    itemByKey.get('LINK_CRAWL_MAX_AGE_HOURS'),
+  ].filter((item): item is SystemConfigItem => Boolean(item));
+  const recommendedSources = sourcesItem?.schema?.defaultValue;
+  const canRestoreRecommendedSources = typeof recommendedSources === 'string' && recommendedSources.trim().length > 0;
+  const sourceValue = sourcesItem && !sourcesItem.rawValueExists && typeof recommendedSources === 'string'
+    ? recommendedSources
+    : String(sourcesItem?.value ?? '');
+  const { sources, rawEntries } = parseLinkCrawlSources(sourceValue);
+  const sourceEditable = Boolean(sourcesItem?.schema?.isEditable) && !disabled;
+  const [pendingSources, setPendingSources] = useState<LinkCrawlSource[]>([]);
+  const sourceRows = [
+    ...sources.map((source, index) => ({ source, index, isPending: false })),
+    ...pendingSources.map((source, index) => ({ source, index, isPending: true })),
+  ];
+
+  const updateSources = (nextSources: LinkCrawlSource[], nextRawEntries = rawEntries) => {
+    if (!sourcesItem) {
+      return;
+    }
+    onChange(sourcesItem.key, serializeLinkCrawlSources(nextSources, nextRawEntries));
+  };
+
+  const updatePendingSource = (pendingIndex: number, nextSource: LinkCrawlSource) => {
+    const nextPendingSources = [...pendingSources];
+    nextPendingSources[pendingIndex] = nextSource;
+    const completedSources = nextPendingSources.filter(isCompleteLinkCrawlSource);
+    setPendingSources(nextPendingSources.filter((source) => !isCompleteLinkCrawlSource(source)));
+    if (completedSources.length) {
+      updateSources([...sources, ...completedSources]);
+    }
+  };
+
+  return (
+    <SettingsSectionCard
+      title="链接爬虫新闻源"
+      description="已配置页面会在每次分析时实时抓取，并合并到 LLM 新闻上下文。"
+    >
+      <div className="overflow-hidden rounded-2xl border settings-border bg-background/30">
+        <div className="flex flex-col gap-3 border-b border-[var(--settings-border-soft)] px-4 py-4 md:flex-row md:items-start md:justify-between">
+          <div className="min-w-0 space-y-1">
+            <p className="text-sm font-semibold text-foreground">来源列表</p>
+            <p className="text-xs leading-5 text-muted-text">
+              每条格式：<code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] text-foreground">标签|市场|URL</code>，市场可选 cn / hk / us / global。
+            </p>
+          </div>
+          <Button
+            type="button"
+            variant="settings-secondary"
+            size="sm"
+            onClick={() => sourcesItem && onChange(sourcesItem.key, recommendedSources as string)}
+            disabled={!sourceEditable || !canRestoreRecommendedSources}
+            title={canRestoreRecommendedSources ? '替换当前未保存的来源草稿' : '后端未提供推荐 A 股源'}
+          >
+            <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+            恢复推荐 A 股源
+          </Button>
+        </div>
+        {!canRestoreRecommendedSources ? (
+          <p className="border-b border-[var(--settings-border-soft)] bg-amber-500/5 px-4 py-2.5 text-xs leading-5 text-amber-800 dark:text-amber-200">
+            后端尚未提供推荐 A 股源，页面不会用内置 URL 覆盖当前草稿。
+          </p>
+        ) : null}
+
+        {sourcesItem ? (
+          <div className="space-y-3 px-4 py-4">
+            {sourceRows.length ? (
+              <div className="space-y-2">
+                {sourceRows.map(({ source, index, isPending }, rowIndex) => (
+                  <div
+                    className="grid grid-cols-1 gap-2 rounded-xl border border-[var(--settings-border-soft)] bg-[var(--settings-surface)] p-3 sm:grid-cols-[minmax(110px,0.7fr)_100px_minmax(0,1.6fr)_auto] sm:items-end"
+                    key={`${isPending ? 'pending' : 'saved'}-${source.label}-${source.market}-${source.url}-${index}`}
+                  >
+                    <div>
+                      <label className="mb-1.5 block text-[11px] font-semibold tracking-wide text-muted-text" htmlFor={`link-crawl-source-label-${rowIndex}`}>标签</label>
+                      <input
+                        id={`link-crawl-source-label-${rowIndex}`}
+                        className="input-surface input-focus-glow h-10 w-full rounded-lg border bg-transparent px-3 text-sm focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                        value={source.label}
+                        disabled={!sourceEditable}
+                        onChange={(event) => {
+                          const nextSource = { ...source, label: event.target.value };
+                          if (isPending) {
+                            updatePendingSource(index, nextSource);
+                            return;
+                          }
+                          const nextSources = [...sources];
+                          nextSources[index] = nextSource;
+                          updateSources(nextSources);
+                        }}
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-1.5 block text-[11px] font-semibold tracking-wide text-muted-text" htmlFor={`link-crawl-source-market-${rowIndex}`}>市场</label>
+                      <select
+                        id={`link-crawl-source-market-${rowIndex}`}
+                        className="input-surface input-focus-glow h-10 w-full rounded-lg border bg-transparent px-3 text-sm text-foreground focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                        value={source.market}
+                        disabled={!sourceEditable}
+                        onChange={(event) => {
+                          const nextSource = { ...source, market: event.target.value as LinkCrawlMarket };
+                          if (isPending) {
+                            updatePendingSource(index, nextSource);
+                            return;
+                          }
+                          const nextSources = [...sources];
+                          nextSources[index] = nextSource;
+                          updateSources(nextSources);
+                        }}
+                      >
+                        <option value="cn">cn · A 股</option>
+                        <option value="hk">hk · 港股</option>
+                        <option value="us">us · 美股</option>
+                        <option value="global">global · 全球</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="mb-1.5 block text-[11px] font-semibold tracking-wide text-muted-text" htmlFor={`link-crawl-source-url-${rowIndex}`}>URL</label>
+                      <input
+                        id={`link-crawl-source-url-${rowIndex}`}
+                        type="url"
+                        className="input-surface input-focus-glow h-10 w-full rounded-lg border bg-transparent px-3 text-sm focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                        value={source.url}
+                        disabled={!sourceEditable}
+                        onChange={(event) => {
+                          const nextSource = { ...source, url: event.target.value };
+                          if (isPending) {
+                            updatePendingSource(index, nextSource);
+                            return;
+                          }
+                          const nextSources = [...sources];
+                          nextSources[index] = nextSource;
+                          updateSources(nextSources);
+                        }}
+                      />
+                    </div>
+                    <Button
+                      type="button"
+                      variant="settings-secondary"
+                      size="sm"
+                      className="h-10 px-3 text-muted-text hover:text-danger"
+                      disabled={!sourceEditable}
+                      onClick={() => {
+                        if (isPending) {
+                          setPendingSources(pendingSources.filter((_, pendingIndex) => pendingIndex !== index));
+                          return;
+                        }
+                        updateSources(sources.filter((_, sourceIndex) => sourceIndex !== index));
+                      }}
+                      aria-label={`删除新闻源 ${rowIndex + 1}`}
+                    >
+                      <Trash2 className="h-4 w-4" aria-hidden="true" />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="rounded-xl border border-dashed border-[var(--settings-border)] bg-[var(--settings-surface)] px-3 py-4 text-sm text-muted-text">
+                暂无可编辑新闻源，可添加来源或恢复推荐 A 股源。
+              </div>
+            )}
+
+            <Button
+              type="button"
+              variant="settings-secondary"
+              size="sm"
+              disabled={!sourceEditable}
+              onClick={() => setPendingSources([...pendingSources, { label: '新新闻源', market: 'cn', url: '' }])}
+            >
+              <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+              添加新闻源
+            </Button>
+
+            {rawEntries.length ? (
+              <div className="rounded-xl border border-amber-500/25 bg-amber-500/5 p-3">
+                <label className="block text-xs font-semibold text-amber-800 dark:text-amber-200" htmlFor="link-crawl-raw-entries">
+                  未能识别的原始条目
+                </label>
+                <p className="mt-1 text-xs leading-5 text-muted-text">
+                  这些条目未按格式解析。编辑时会保留已识别来源；请确认后再保存。
+                </p>
+                <textarea
+                  id="link-crawl-raw-entries"
+                  className="input-surface input-focus-glow mt-2 min-h-[76px] w-full rounded-lg border bg-transparent px-3 py-2 font-mono text-xs focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                  value={rawEntries.join(',')}
+                  disabled={!sourceEditable}
+                  onChange={(event) => updateSources(sources, event.target.value.split(',').filter((entry) => entry.length > 0))}
+                />
+              </div>
+            ) : null}
+            {issueByKey.LINK_CRAWL_SOURCES?.map((issue, index) => (
+              <p className={issue.severity === 'error' ? 'text-xs text-danger' : 'text-xs text-warning'} key={`${issue.code}-${index}`}>
+                {issue.message}
+              </p>
+            ))}
+            <p className="text-[11px] leading-5 text-muted-text">恢复和编辑仅修改草稿；点击页面顶部“保存配置”后才会生效。</p>
+          </div>
+        ) : (
+          <p className="px-4 py-4 text-sm text-muted-text">新闻源配置尚未由服务端注册。</p>
+        )}
+      </div>
+
+      <div className="mt-3 grid gap-3 md:grid-cols-2">
+        {enabledItem ? (
+          <label className="flex cursor-pointer items-center justify-between gap-4 rounded-xl border settings-border bg-background/30 px-4 py-3 has-[:disabled]:cursor-not-allowed has-[:disabled]:opacity-60">
+            <span>
+              <span className="block text-sm font-semibold text-foreground">启用链接爬虫</span>
+              <span className="mt-1 block text-xs leading-5 text-muted-text">关闭后保留来源列表，不参与分析。</span>
+            </span>
+            <input
+              aria-label="启用链接爬虫"
+              type="checkbox"
+              className="h-4 w-4 accent-primary"
+              checked={enabledItem.value.trim().toLowerCase() === 'true'}
+              disabled={disabled || !enabledItem.schema?.isEditable}
+              onChange={(event) => onChange(enabledItem.key, event.target.checked ? 'true' : 'false')}
+            />
+          </label>
+        ) : null}
+        {limitItems.length ? (
+          <div className={enabledItem ? 'md:col-span-2' : ''}>
+            <div className="overflow-hidden rounded-xl border settings-border bg-[var(--settings-surface)] divide-y divide-[var(--settings-border-soft)]">
+              {limitItems.map((item) => (
+                <SettingsField
+                  key={item.key}
+                  item={item}
+                  value={item.value}
+                  disabled={disabled}
+                  onChange={onChange}
+                  issues={issueByKey[item.key] || []}
+                />
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </SettingsSectionCard>
+  );
+}
+
 function isPromptCacheAdvancedSetting(item: { key: string }) {
   return PROMPT_CACHE_ADVANCED_SETTING_KEYS.has(item.key);
 }
@@ -1049,6 +1375,8 @@ const SettingsPage: React.FC = () => {
   const alphasiftEnabled = String(alphasiftItem?.value ?? '').trim().toLowerCase() === 'true';
   const shouldShowFirstRunSetup = activeCategory === 'base';
   const shouldShowAlphaSiftSettings = activeCategory === 'data_source' && Boolean(alphasiftItem);
+  const linkCrawlItems = (itemsByCategory.data_source || []).filter((item) => LINK_CRAWL_SETTING_KEYS.has(item.key));
+  const shouldShowLinkCrawlSettings = activeCategory === 'data_source' && linkCrawlItems.length > 0;
   const hasConfiguredChannels = Boolean((rawActiveItemMap.get('LLM_CHANNELS') || '').trim());
   const hasLitellmConfig = Boolean((rawActiveItemMap.get('LITELLM_CONFIG') || '').trim());
   const hasRuntimeSchedulerMismatch =
@@ -1105,6 +1433,7 @@ const SettingsPage: React.FC = () => {
   ]);
   const DATA_SOURCE_HIDDEN_KEYS = new Set([
     'ALPHASIFT_ENABLED',
+    ...LINK_CRAWL_SETTING_KEYS,
   ]);
   const AGENT_HIDDEN_KEYS = new Set(['AGENT_GENERATION_BACKEND']);
   const activeItems =
@@ -1131,7 +1460,8 @@ const SettingsPage: React.FC = () => {
   const visibleActiveItems = activeCategory === 'ai_model'
     ? activeItems.filter((item) => !isPromptCacheAdvancedSetting(item))
     : activeItems;
-  const hasActiveConfigItems = visibleActiveItems.length > 0 || promptCacheAdvancedItems.length > 0;
+  const hasGenericActiveConfigItems = visibleActiveItems.length > 0 || promptCacheAdvancedItems.length > 0;
+  const hasActiveConfigItems = hasGenericActiveConfigItems || shouldShowLinkCrawlSettings;
   const isEnvBackupAllowed = isDesktopRuntime || authEnabled;
   const envBackupActionDisabled = isLoading || isSaving || isExportingEnv || isImportingEnv || !isEnvBackupAllowed;
 
@@ -1411,7 +1741,7 @@ const SettingsPage: React.FC = () => {
     expected: 'single',
     actual: selectedAgentArch,
   };
-  const activeConfigPanel = hasActiveConfigItems ? (
+  const activeConfigPanel = hasGenericActiveConfigItems ? (
     <SettingsSectionCard
       title={activeCategoryTitle}
       description={activeCategoryDescription || t('settings.activePanelDescription')}
@@ -1463,7 +1793,7 @@ const SettingsPage: React.FC = () => {
         </details>
       ) : null}
     </SettingsSectionCard>
-  ) : (
+  ) : shouldShowLinkCrawlSettings ? null : (
     <EmptyState
       title={t('settings.currentCategoryEmptyTitle')}
       description={t('settings.currentCategoryEmptyDescription')}
@@ -1612,6 +1942,14 @@ const SettingsPage: React.FC = () => {
                   </div>
                 ) : null}
               </SettingsSectionCard>
+            ) : null}
+            {shouldShowLinkCrawlSettings ? (
+              <LinkCrawlSettingsCard
+                items={linkCrawlItems}
+                disabled={isSaving || isLoading}
+                issueByKey={issueByKey}
+                onChange={setDraftValue}
+              />
             ) : null}
             {activeCategory === 'system' ? <AuthSettingsCard /> : null}
             {activeCategory === 'system' ? (

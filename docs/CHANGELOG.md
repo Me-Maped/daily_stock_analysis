@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [修复] #2026 外股代码映射到中文显示名时英文新闻相关性判定漏判：新增同源 STOCK_ENGLISH_NAME_MAP 单一真源、canonicalize_foreign_stock_code 规范化入口与 _foreign_english_query_terms 别名解析，使 AAPL/00700/BABA 等 ticker 即使 stock_name 为中文也能在查询构建、相关性打分与多维度情报路径上复用 canonical 英文名，并补齐 .US/.HK suffix / HK 前缀全形式的归类与回归用例；同时在 _score_news_relevance 对 alias 展开 term 做去重，避免 legal alias 展开短名与显式 short alias 重复计分。
 - [新功能] 新增链接爬虫新闻源：用户配置 URL 列表，每次分析实时抓取并合并进 LLM 新闻上下文
+- [改进] 链接爬虫新闻源现可在 Web 设置的“数据源”中配置；未显式配置时默认启用已验证的新浪财经7x24、东方财富财经要闻 A 股源，并支持通过开关或空源列表关闭。
 
 ## [3.27.0] - 2026-07-19
 

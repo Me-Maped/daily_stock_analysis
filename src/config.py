@@ -77,6 +77,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_ALPHASIFT_INSTALL_SPEC = (
     "git+https://github.com/ZhuLinsen/alphasift.git@9f522747caafd3c0b1ddb7e14d5cf44c8580b6cf"
 )
+DEFAULT_LINK_CRAWL_SOURCES = (
+    "新浪财经7x24|cn|https://finance.sina.com.cn/7x24/",
+    "东方财富财经要闻|cn|https://finance.eastmoney.com/a/cgnjj.html",
+)
 
 
 @dataclass
@@ -838,7 +842,7 @@ class Config:
     bias_threshold: float = 5.0  # 乖离率阈值（%），超过此值提示不追高
 
     # === 链接爬虫新闻源配置（用户配置 URL 列表，实时爬取并入 LLM 新闻上下文）===
-    link_crawl_sources: List[str] = field(default_factory=list)  # 格式: 标签|市场|URL，逗号分隔；市场: cn/hk/us/global
+    link_crawl_sources: List[str] = field(default_factory=lambda: list(DEFAULT_LINK_CRAWL_SOURCES))  # 格式: 标签|市场|URL，逗号分隔；市场: cn/hk/us/global
     link_crawl_timeout_sec: float = 10.0  # 单个源拉取超时（秒）
     link_crawl_max_items_per_source: int = 20  # 单源最多提取条数
     link_crawl_max_age_hours: int = 48  # 新闻最大时效（小时），超过则丢弃
@@ -1558,7 +1562,12 @@ class Config:
             default=True,
         )
 
-        link_crawl_sources = [s.strip() for s in os.getenv('LINK_CRAWL_SOURCES', '').split(',') if s.strip()]
+        link_crawl_sources_raw = os.getenv('LINK_CRAWL_SOURCES')
+        link_crawl_sources = (
+            [s.strip() for s in link_crawl_sources_raw.split(',') if s.strip()]
+            if 'LINK_CRAWL_SOURCES' in os.environ
+            else list(DEFAULT_LINK_CRAWL_SOURCES)
+        )
 
         # 企微消息类型与最大字节数逻辑
         wechat_msg_type = os.getenv('WECHAT_MSG_TYPE', 'markdown')

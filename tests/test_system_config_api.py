@@ -175,6 +175,26 @@ class SystemConfigApiTestCase(unittest.TestCase):
         self.assertIn("claude_code_cli", generation_schema["validation"]["enum"])
         self.assertIn("opencode_cli", generation_schema["validation"]["enum"])
 
+    def test_get_config_schema_exposes_link_crawler_data_source_fields(self) -> None:
+        payload = system_config.get_system_config(include_schema=True, service=self.service).model_dump(by_alias=True)
+        item_map = {item["key"]: item for item in payload["items"]}
+
+        self.assertEqual(item_map["LINK_CRAWL_SOURCES"]["schema"]["category"], "data_source")
+        self.assertEqual(item_map["LINK_CRAWL_SOURCES"]["schema"]["ui_control"], "textarea")
+        self.assertEqual(item_map["LINK_CRAWL_ENABLED"]["schema"]["data_type"], "boolean")
+        self.assertEqual(
+            item_map["LINK_CRAWL_TIMEOUT_SEC"]["schema"]["validation"],
+            {"min": 1, "max": 60},
+        )
+        self.assertEqual(
+            item_map["LINK_CRAWL_MAX_ITEMS_PER_SOURCE"]["schema"]["validation"],
+            {"min": 1, "max": 200},
+        )
+        self.assertEqual(
+            item_map["LINK_CRAWL_MAX_AGE_HOURS"]["schema"]["validation"],
+            {"min": 1, "max": 720},
+        )
+
     def test_get_config_schema_includes_notification_noise_fields(self) -> None:
         payload = system_config.get_system_config(include_schema=True, service=self.service).model_dump(by_alias=True)
         item_map = {item["key"]: item for item in payload["items"]}

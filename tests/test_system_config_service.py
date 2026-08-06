@@ -2041,6 +2041,45 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         current_map = self.manager.read_config_map()
         self.assertEqual(current_map["SEARXNG_PUBLIC_INSTANCES_ENABLED"], "false")
 
+    def test_update_link_crawler_settings_validates_writes_and_reloads(self) -> None:
+        response = self.service.update(
+            config_version=self.manager.get_config_version(),
+            items=[
+                {"key": "LINK_CRAWL_SOURCES", "value": "测试源|cn|https://news.example.com/live"},
+                {"key": "LINK_CRAWL_ENABLED", "value": "false"},
+                {"key": "LINK_CRAWL_TIMEOUT_SEC", "value": "12.5"},
+                {"key": "LINK_CRAWL_MAX_ITEMS_PER_SOURCE", "value": "30"},
+                {"key": "LINK_CRAWL_MAX_AGE_HOURS", "value": "72"},
+            ],
+            reload_now=True,
+        )
+
+        self.assertTrue(response["success"])
+        self.assertTrue(response["reload_triggered"])
+        self.assertEqual(set(response["updated_keys"]), {
+            "LINK_CRAWL_SOURCES",
+            "LINK_CRAWL_ENABLED",
+            "LINK_CRAWL_TIMEOUT_SEC",
+            "LINK_CRAWL_MAX_ITEMS_PER_SOURCE",
+            "LINK_CRAWL_MAX_AGE_HOURS",
+        })
+        self.assertEqual(
+            self.manager.read_config_map()["LINK_CRAWL_SOURCES"],
+            "测试源|cn|https://news.example.com/live",
+        )
+        config = Config.get_instance()
+        self.assertEqual(config.link_crawl_sources, ["测试源|cn|https://news.example.com/live"])
+        self.assertFalse(config.link_crawl_enabled)
+        self.assertEqual(config.link_crawl_timeout_sec, 12.5)
+        self.assertEqual(config.link_crawl_max_items_per_source, 30)
+        self.assertEqual(config.link_crawl_max_age_hours, 72)
+
+        validation = self.service.validate(
+            items=[{"key": "LINK_CRAWL_TIMEOUT_SEC", "value": "61"}]
+        )
+        self.assertFalse(validation["valid"])
+        self.assertTrue(any(issue["code"] == "out_of_range" for issue in validation["issues"]))
+
     def test_validate_reports_invalid_llm_channel_definition(self) -> None:
         validation = self.service.validate(
             items=[

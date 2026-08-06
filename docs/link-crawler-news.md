@@ -1,7 +1,7 @@
 # 链接爬虫新闻源（Link Crawler News）
 
-用户配置 URL 列表（如财联社电报页、华尔街见闻快讯页），每次个股分析时由 `LinkCrawlerService`
-实时抓取页面中的新闻链接，去重、时效过滤后合并进 LLM 新闻上下文，增强模型对最新消息的感知。
+链接爬虫新闻源会在每次个股分析时实时抓取页面新闻链接，去重、时效过滤后合并进 LLM
+新闻上下文，增强模型对最新消息的感知。
 
 ## 功能说明
 
@@ -10,12 +10,24 @@
 - 抓取到的条目按 URL 去重（批次内 + 该股票历史入库记录），并持久化到 `crawl_news_items` 表。
 - 支持 RSS/Atom feed 自动识别；普通 HTML 页面优先用 bs4 提取 `<a>` 新闻链接（无 bs4 时回退正则）。
 
-## 配置格式与示例
+## 设置与默认值
 
-配置项位于 `.env`，格式为 `标签|市场|URL`，多个源用英文逗号分隔：
+在 Web **设置 > 数据源** 中配置，保存后才会写入 `.env`。未保存时不会因默认值自动改写
+`.env`。
+
+未显式设置 `LINK_CRAWL_SOURCES` 和 `LINK_CRAWL_ENABLED` 时，爬虫默认开启，并使用以下已验证的
+A 股 HTML 新闻源：
 
 ```
-LINK_CRAWL_SOURCES=财联社热闻|cn|https://www.cls.cn/telegraph,华尔街见闻快讯|cn|https://wallstreetcn.com/live/global
+新浪财经7x24|cn|https://finance.sina.com.cn/7x24/
+东方财富财经要闻|cn|https://finance.eastmoney.com/a/cgnjj.html
+```
+
+新闻源格式为 `标签|市场|URL`，多个源用英文逗号分隔；市场支持 `cn` / `hk` / `us` /
+`global`。Web 设置或 `.env` 可按需覆盖：
+
+```
+LINK_CRAWL_SOURCES=新浪财经7x24|cn|https://finance.sina.com.cn/7x24/,东方财富财经要闻|cn|https://finance.eastmoney.com/a/cgnjj.html
 LINK_CRAWL_TIMEOUT_SEC=10
 LINK_CRAWL_MAX_ITEMS_PER_SOURCE=20
 LINK_CRAWL_MAX_AGE_HOURS=48
@@ -28,7 +40,14 @@ LINK_CRAWL_ENABLED=true
 - `LINK_CRAWL_TIMEOUT_SEC`：单个源拉取超时（秒，默认 10）。
 - `LINK_CRAWL_MAX_ITEMS_PER_SOURCE`：单源最多提取条数（默认 20）。
 - `LINK_CRAWL_MAX_AGE_HOURS`：新闻最大时效（小时，默认 48），条目带发布日期且超龄时丢弃。
-- `LINK_CRAWL_ENABLED`：显式设为 `false` 可整体关闭（默认 `true`）。
+- `LINK_CRAWL_ENABLED`：未设置时默认 `true`；显式设为 `false` 可整体关闭。
+
+### 覆盖与关闭
+
+- `LINK_CRAWL_SOURCES` 未设置时使用默认源；显式设置为任意非空列表时完全替换默认源。
+- `LINK_CRAWL_SOURCES=` 是显式空列表，会关闭全部新闻源，不会回退到默认源。
+- `LINK_CRAWL_ENABLED=false` 会整体关闭爬虫；保留源列表，之后设回 `true` 即可恢复。
+- Docker/部署环境若也注入 `LINK_CRAWL_*`，运行时环境变量优先于 `.env`；避免两处配置同一键，网页设置页显示的是已保存的 `.env` 值。
 
 ## 行为细节
 

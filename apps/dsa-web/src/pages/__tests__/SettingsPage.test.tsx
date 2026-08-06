@@ -492,6 +492,57 @@ function buildAgentItem(
   };
 }
 
+function buildLinkCrawlItem(
+  key: string,
+  value: string,
+  displayOrder: number,
+  options: { defaultValue?: string; rawValueExists?: boolean; uiControl?: 'textarea' | 'switch' | 'number' } = {},
+) {
+  const uiControl = options.uiControl ?? (key === 'LINK_CRAWL_ENABLED' ? 'switch' : key === 'LINK_CRAWL_SOURCES' ? 'textarea' : 'number');
+  return {
+    key,
+    value,
+    rawValueExists: options.rawValueExists ?? true,
+    isMasked: false,
+    schema: {
+      key,
+      category: 'data_source',
+      dataType: uiControl === 'switch' ? 'boolean' : uiControl === 'number' ? 'integer' : 'string',
+      uiControl,
+      isSensitive: false,
+      isRequired: false,
+      isEditable: true,
+      options: [],
+      validation: {},
+      displayOrder,
+      ...(options.defaultValue === undefined ? {} : { defaultValue: options.defaultValue }),
+    },
+  };
+}
+
+function buildLinkCrawlConfigState(overrides: ConfigOverride = {}) {
+  const configState = buildSystemConfigState();
+  return buildSystemConfigState({
+    ...overrides,
+    activeCategory: 'data_source',
+    itemsByCategory: {
+      ...configState.itemsByCategory,
+      data_source: [
+        buildLinkCrawlItem(
+          'LINK_CRAWL_SOURCES',
+          '东方财富|cn|https://finance.eastmoney.com,华尔街见闻|global|https://wallstreetcn.com,broken-entry',
+          20,
+          { defaultValue: '推荐财经|cn|https://example.com/a,推荐公告|cn|https://example.com/b' },
+        ),
+        buildLinkCrawlItem('LINK_CRAWL_ENABLED', 'true', 21),
+        buildLinkCrawlItem('LINK_CRAWL_TIMEOUT_SEC', '12', 22),
+        buildLinkCrawlItem('LINK_CRAWL_MAX_ITEMS_PER_SOURCE', '8', 23),
+        buildLinkCrawlItem('LINK_CRAWL_MAX_AGE_HOURS', '24', 24),
+      ],
+    },
+  });
+}
+
 function createDeferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -978,6 +1029,166 @@ describe('SettingsPage', () => {
     // Reset should call resetDraft and NOT call load
     expect(resetDraft).toHaveBeenCalledTimes(1);
     expect(load).not.toHaveBeenCalled();
+  });
+
+  it('renders dedicated link crawler source controls and hides raw crawler fields', () => {
+    useSystemConfigMock.mockReturnValue(buildLinkCrawlConfigState());
+
+    render(<SettingsPage />);
+
+    expect(screen.getByRole('heading', { name: '链接爬虫新闻源' })).toBeInTheDocument();
+    expect(screen.getByText(/已配置页面会在每次分析时实时抓取/)).toBeInTheDocument();
+    expect(screen.getAllByLabelText('标签')[0]).toHaveValue('东方财富');
+    expect(screen.getAllByLabelText('市场')[0]).toHaveValue('cn');
+    expect(screen.getAllByLabelText('URL')[0]).toHaveValue('https://finance.eastmoney.com');
+    expect(screen.getByLabelText('未能识别的原始条目')).toHaveValue('broken-entry');
+    expect(screen.getByLabelText('启用链接爬虫')).toBeChecked();
+    expect(screen.queryByTestId('settings-field-LINK_CRAWL_SOURCES')).not.toBeInTheDocument();
+    expect(screen.getByTestId('settings-field-LINK_CRAWL_TIMEOUT_SEC')).toBeInTheDocument();
+  });
+
+  it('uses schema defaults only when link crawler sources have no persisted raw value', () => {
+    const defaultOnlyState = buildLinkCrawlConfigState();
+    const [sourcesItem, ...remainingItems] = defaultOnlyState.itemsByCategory.data_source;
+    useSystemConfigMock.mockReturnValue({
+      ...defaultOnlyState,
+      itemsByCategory: {
+        ...defaultOnlyState.itemsByCategory,
+        data_source: [{ ...sourcesItem, value: '', rawValueExists: false }, ...remainingItems],
+      },
+    });
+
+    render(<SettingsPage />);
+
+    expect(screen.getAllByLabelText('标签')[0]).toHaveValue('推荐财经');
+    expect(screen.getAllByLabelText('标签')[1]).toHaveValue('推荐公告');
+
+    fireEvent.click(screen.getByRole('button', { name: '删除新闻源 2' }));
+    expect(setDraftValue).toHaveBeenLastCalledWith('LINK_CRAWL_SOURCES', '推荐财经|cn|https://example.com/a');
+
+    fireEvent.click(screen.getByRole('button', { name: '添加新闻源' }));
+    fireEvent.change(screen.getAllByLabelText('URL')[2], { target: { value: 'https://custom.example/news' } });
+    expect(setDraftValue).toHaveBeenLastCalledWith(
+      'LINK_CRAWL_SOURCES',
+      '推荐财经|cn|https://example.com/a,推荐公告|cn|https://example.com/b,新新闻源|cn|https://custom.example/news',
+    );
+  });
+
+  it('keeps an explicitly persisted empty link crawler source list empty', () => {
+    const emptyState = buildLinkCrawlConfigState();
+    const [sourcesItem, ...remainingItems] = emptyState.itemsByCategory.data_source;
+    useSystemConfigMock.mockReturnValue({
+      ...emptyState,
+      itemsByCategory: {
+        ...emptyState.itemsByCategory,
+        data_source: [{ ...sourcesItem, value: '', rawValueExists: true }, ...remainingItems],
+      },
+    });
+
+    render(<SettingsPage />);
+
+    expect(screen.queryByLabelText('标签')).not.toBeInTheDocument();
+    expect(screen.getByText('暂无可编辑新闻源，可添加来源或恢复推荐 A 股源。')).toBeInTheDocument();
+  });
+
+  it('serializes source row edits while preserving unparseable raw entries', () => {
+    useSystemConfigMock.mockReturnValue(buildLinkCrawlConfigState());
+
+    render(<SettingsPage />);
+
+    fireEvent.change(screen.getAllByLabelText('标签')[0], { target: { value: '财经首页' } });
+    expect(setDraftValue).toHaveBeenCalledWith(
+      'LINK_CRAWL_SOURCES',
+      '财经首页|cn|https://finance.eastmoney.com,华尔街见闻|global|https://wallstreetcn.com,broken-entry',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '删除新闻源 2' }));
+    expect(setDraftValue).toHaveBeenLastCalledWith(
+      'LINK_CRAWL_SOURCES',
+      '东方财富|cn|https://finance.eastmoney.com,broken-entry',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '添加新闻源' }));
+    fireEvent.change(screen.getAllByLabelText('URL')[2], { target: { value: 'https://new-source.example/news' } });
+    expect(setDraftValue).toHaveBeenLastCalledWith(
+      'LINK_CRAWL_SOURCES',
+      '东方财富|cn|https://finance.eastmoney.com,华尔街见闻|global|https://wallstreetcn.com,新新闻源|cn|https://new-source.example/news,broken-entry',
+    );
+  });
+
+  it('keeps semantic-invalid three-part source entries in raw fallback without duplication', () => {
+    const invalidSourceValue = [
+      '|cn|https://empty-label.example',
+      '缺少链接|hk|',
+      'FTP 来源|us|ftp://example.com/feed',
+      '未知市场|mars|https://market.example',
+      '有效来源|global|https://valid.example/feed',
+    ].join(',');
+    const invalidState = buildLinkCrawlConfigState();
+    const [sourcesItem, ...remainingItems] = invalidState.itemsByCategory.data_source;
+    useSystemConfigMock.mockReturnValue({
+      ...invalidState,
+      itemsByCategory: {
+        ...invalidState.itemsByCategory,
+        data_source: [{ ...sourcesItem, value: invalidSourceValue }, ...remainingItems],
+      },
+    });
+
+    render(<SettingsPage />);
+
+    expect(screen.getAllByLabelText('标签')).toHaveLength(1);
+    expect(screen.getByLabelText('未能识别的原始条目')).toHaveValue([
+      '|cn|https://empty-label.example',
+      '缺少链接|hk|',
+      'FTP 来源|us|ftp://example.com/feed',
+      '未知市场|mars|https://market.example',
+    ].join(','));
+
+    fireEvent.change(screen.getByLabelText('标签'), { target: { value: '已编辑来源' } });
+    expect(setDraftValue).toHaveBeenLastCalledWith(
+      'LINK_CRAWL_SOURCES',
+      `已编辑来源|global|https://valid.example/feed,${[
+        '|cn|https://empty-label.example',
+        '缺少链接|hk|',
+        'FTP 来源|us|ftp://example.com/feed',
+        '未知市场|mars|https://market.example',
+      ].join(',')}`,
+    );
+  });
+
+  it('restores backend-provided recommended sources as an unsaved draft', () => {
+    useSystemConfigMock.mockReturnValue(buildLinkCrawlConfigState());
+
+    render(<SettingsPage />);
+
+    fireEvent.click(screen.getByRole('button', { name: '恢复推荐 A 股源' }));
+
+    expect(setDraftValue).toHaveBeenCalledWith(
+      'LINK_CRAWL_SOURCES',
+      '推荐财经|cn|https://example.com/a,推荐公告|cn|https://example.com/b',
+    );
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it('saves link crawler drafts through the existing settings save action', async () => {
+    save.mockResolvedValue({ success: true });
+    useSystemConfigMock.mockReturnValue(buildLinkCrawlConfigState({
+      hasDirty: true,
+      dirtyCount: 1,
+      getChangedItems: () => [{
+        key: 'LINK_CRAWL_SOURCES',
+        value: '财经首页|cn|https://finance.eastmoney.com',
+      }],
+    }));
+
+    render(<SettingsPage />);
+
+    fireEvent.click(screen.getByRole('button', { name: /保存配置/ }));
+
+    await waitFor(() => expect(save).toHaveBeenCalledWith([{
+      key: 'LINK_CRAWL_SOURCES',
+      value: '财经首页|cn|https://finance.eastmoney.com',
+    }]));
   });
 
   it('shows deep research and event monitor fields in the agent category when available', () => {
