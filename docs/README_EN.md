@@ -55,7 +55,7 @@ English | [简体中文](../README.md) | [繁體中文](README_CHT.md)
 
 | Type | Supported |
 |------|-----------|
-| AI Models | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC), [AIHubMix](https://aihubmix.com/?aff=CfMq), Gemini, OpenAI-compatible providers, DeepSeek, Qwen, Claude, Ollama |
+| AI Models | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC), [AIHubMix](https://inferera.com/?aff=CfMq), Gemini, OpenAI-compatible providers, DeepSeek, Qwen, Claude, Ollama |
 | Market Data | [TickFlow](https://tickflow.org/auth/register?ref=WDSGSPS5XC), AkShare, Tushare, Pytdx, Baostock, YFinance, Longbridge |
 | News Search | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC), [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis), [Tavily](https://tavily.com/), [Bocha](https://open.bocha.cn/), [Brave](https://brave.com/search/api/), [MiniMax](https://platform.minimaxi.com/), SearXNG |
 | Social Sentiment | [Stock Sentiment API](https://api.adanos.org/docs) for Reddit / X / Polymarket, US stocks only |
@@ -83,7 +83,7 @@ Start with one provider and one API key. For multi-model routing, image recognit
 | Secret Name | Description | Required |
 |-------------|-------------|:--------:|
 | `ANSPIRE_API_KEYS` | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC) API key, one key for popular LLMs and web search with free quota for this project | **Recommended** |
-| `AIHUBMIX_KEY` | [AIHubMix](https://aihubmix.com/?aff=CfMq) API key, one key for multiple model families and a 10% top-up discount for this project | **Recommended** |
+| `AIHUBMIX_KEY` | [AIHubMix](https://inferera.com/?aff=CfMq) API key, one key for multiple model families and a 10% top-up discount for this project | **Recommended** |
 | `GEMINI_API_KEY` | Google Gemini API key | Optional |
 | `ANTHROPIC_API_KEY` | Anthropic Claude API key | Optional |
 | `OPENAI_API_KEY` | OpenAI-compatible API key, including DeepSeek and Qwen-compatible services | Optional |
@@ -243,11 +243,11 @@ After configuring any available AI API key, the Web `/chat` page can use strateg
 
 ## 🧩 Related Projects
 
-> DSA focuses on daily analysis reports. These sibling projects cover stock screening, strategy validation, and strategy evolution for users who want to extend the workflow. They are maintained independently today, with candidate import, backtest validation, and report handoff planned as future integration directions.
+> DSA focuses on daily analysis reports. Its screening implementation references AlphaSift, while AlphaEvo covers strategy validation and evolution.
 
 | Project | Focus |
 |---------|-------|
-| [AlphaSift](https://github.com/ZhuLinsen/alphasift) | Multi-factor stock screening and full-market scanning for building candidate watchlists |
+| [AlphaSift](https://github.com/ZhuLinsen/alphasift) | Reference project for DSA's screening implementation |
 | [AlphaEvo](https://github.com/ZhuLinsen/alphaevo) | Strategy backtesting and self-evolution experiments for validating rules and iteratively exploring strategy parameters and combinations |
 
 ## 📞 Contact

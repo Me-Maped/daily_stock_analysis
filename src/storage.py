@@ -34,6 +34,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     UniqueConstraint,
+    CheckConstraint,
     Text,
     text,
     select,
@@ -133,15 +134,23 @@ class StockDaily(Base):
     
     # 数据来源
     data_source = Column(String(50))  # 记录数据来源（如 AkshareFetcher）
-    
+
+    # canonical_id：Phase 1 前缀格式的稳定分析目标键（如 sh000300 / sh600519 / AAPL）。
+    # Expand-Contract PR2：仅加列 + 双写，读路径仍用 ``code`` 列；PR3/PR4 再切读路径。
+    # 可空：存量行由自愈式迁移 backfill；新写由 ``save_daily_data`` 推导或显式传入。
+    # 普通索引（非唯一）：历史别名行可能共享同一 canonical_id + date，唯一索引会撞。
+    canonical_id = Column(String(32), nullable=True)
+
     # 更新时间
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
-    
+
     # 唯一约束：同一股票同一日期只能有一条数据
     __table_args__ = (
         UniqueConstraint('code', 'date', name='uix_code_date'),
         Index('ix_code_date', 'code', 'date'),
+        # 普通索引：允许历史别名行（同 canonical_id + date）共存（AC 9）。
+        Index('ix_stock_daily_canonical_id', 'canonical_id'),
     )
     
     def __repr__(self):
@@ -164,6 +173,7 @@ class StockDaily(Base):
             'ma20': self.ma20,
             'volume_ratio': self.volume_ratio,
             'data_source': self.data_source,
+            'canonical_id': self.canonical_id,
         }
 
 
@@ -322,6 +332,32 @@ class FundamentalSnapshot(Base):
 
     def __repr__(self) -> str:
         return f"<FundamentalSnapshot(query_id={self.query_id}, code={self.code})>"
+
+
+class ScreeningRun(Base):
+    """A completed built-in screening run persisted by DSA."""
+
+    __tablename__ = 'screening_runs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(64), nullable=False, unique=True, index=True)
+    strategy = Column(String(64), nullable=False, index=True)
+    market = Column(String(16), nullable=False, index=True)
+    snapshot_source = Column(String(64), index=True)
+    snapshot_count = Column(Integer)
+    after_filter_count = Column(Integer)
+    candidate_count = Column(Integer, nullable=False, default=0)
+    llm_ranked = Column(Boolean)
+    daily_enriched = Column(Boolean)
+    source_errors_json = Column(Text)
+    warnings_json = Column(Text)
+    result_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+    __table_args__ = (
+        Index('ix_screening_run_strategy_created', 'strategy', 'created_at'),
+        Index('ix_screening_run_market_created', 'market', 'created_at'),
+    )
 
 
 class AnalysisHistory(Base):
@@ -721,6 +757,17 @@ class ConversationMessage(Base):
     role = Column(String(20), nullable=False)  # user, assistant, system
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.now, index=True)
+
+
+class ConversationSessionState(Base):
+    """Persisted user selections for an Agent chat session."""
+
+    __tablename__ = 'conversation_session_states'
+
+    session_id = Column(String(100), primary_key=True)
+    selected_skill_ids_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
 
 
 class ConversationSummary(Base):
@@ -1156,6 +1203,127 @@ class DecisionSignalFeedbackRecord(Base):
     updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, index=True)
 
 
+class SkillOpinionSampleRecord(Base):
+    """Immutable, low-sensitivity skill opinion sample for Issue #1904 P2 PR1."""
+
+    __tablename__ = 'skill_opinion_samples'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    analysis_history_id = Column(
+        Integer,
+        ForeignKey('analysis_history.id'),
+        nullable=False,
+        index=True,
+    )
+    stock_code = Column(String(16), nullable=False, index=True)
+    skill_id = Column(String(128), nullable=False, index=True)
+    skill_version = Column(String(64), index=True)
+    signal = Column(String(16), nullable=False, index=True)
+    confidence = Column(Float, nullable=False)
+    horizon = Column(String(16), index=True)
+    data_quality_level = Column(String(24), index=True)
+    opinion_created_at = Column(DateTime, index=True)
+    sample_schema_version = Column(String(32), nullable=False, index=True)
+    created_at = Column(DateTime, default=utc_naive_now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'analysis_history_id',
+            'skill_id',
+            'sample_schema_version',
+            name='uix_skill_opinion_sample_key',
+        ),
+        Index(
+            'ix_skill_opinion_sample_skill_horizon_created',
+            'skill_id',
+            'horizon',
+            'created_at',
+        ),
+        Index(
+            'ix_skill_opinion_sample_stock_created',
+            'stock_code',
+            'created_at',
+        ),
+    )
+
+
+class SkillOpinionOutcomeRecord(Base):
+    """Forward outcome for one immutable skill opinion sample and horizon."""
+
+    __tablename__ = 'skill_opinion_outcomes'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skill_opinion_sample_id = Column(
+        Integer,
+        ForeignKey('skill_opinion_samples.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    horizon = Column(String(16), nullable=False, index=True)
+    engine_version = Column(String(32), nullable=False, index=True)
+    eval_status = Column(String(24), nullable=False, default='pending', index=True)
+    outcome = Column(String(16), index=True)
+    direction_correct = Column(Boolean)
+    unable_reason = Column(String(64), index=True)
+    analysis_date = Column(Date, index=True)
+    start_trade_date = Column(Date, index=True)
+    end_trade_date = Column(Date, index=True)
+    start_price = Column(Float)
+    end_close = Column(Float)
+    stock_return_pct = Column(Float)
+    directional_return_pct = Column(Float)
+    created_at = Column(DateTime, default=utc_naive_now, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'skill_opinion_sample_id',
+            'horizon',
+            'engine_version',
+            name='uix_skill_opinion_outcome_key',
+        ),
+        CheckConstraint(
+            "horizon IN ('1d', '3d', '5d', '10d')",
+            name='ck_skill_opinion_outcome_horizon',
+        ),
+        CheckConstraint(
+            "eval_status IN ('pending', 'evaluated', 'observational', 'unable')",
+            name='ck_skill_opinion_outcome_eval_status',
+        ),
+        CheckConstraint(
+            "outcome IS NULL OR outcome IN ('hit', 'miss', 'observational')",
+            name='ck_skill_opinion_outcome_value',
+        ),
+        CheckConstraint(
+            "(eval_status IN ('pending', 'unable') "
+            "AND outcome IS NULL "
+            "AND direction_correct IS NULL "
+            "AND directional_return_pct IS NULL) "
+            "OR (eval_status = 'observational' "
+            "AND outcome = 'observational' "
+            "AND direction_correct IS NULL "
+            "AND directional_return_pct IS NULL) "
+            "OR (eval_status = 'evaluated' "
+            "AND outcome IN ('hit', 'miss') "
+            "AND direction_correct IS NOT NULL "
+            "AND directional_return_pct IS NOT NULL)",
+            name='ck_skill_opinion_outcome_state_fields',
+        ),
+        Index(
+            'ix_skill_opinion_outcome_candidate',
+            'engine_version',
+            'eval_status',
+            'updated_at',
+        ),
+        Index(
+            'ix_skill_opinion_outcome_horizon_status',
+            'engine_version',
+            'horizon',
+            'eval_status',
+        ),
+    )
+
+
 class _DatabaseManagerMeta(type):
     """Serialize DatabaseManager construction across __new__ and __init__."""
 
@@ -1238,6 +1406,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             Base.metadata.create_all(self._engine)
             self._ensure_llm_usage_telemetry_columns()
             self._ensure_decision_signal_profile_schema()
+            self._ensure_stock_daily_canonical_id()
             self._ensure_intelligence_item_scope_values()
             self._ensure_schema_migration_record()
             self._ensure_intelligence_items_unique_index()
@@ -1464,6 +1633,221 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             stats["non_object_count"],
             stats["invalid_profile_count"],
             stats["skipped_existing_profile_count"],
+        )
+
+    def _ensure_stock_daily_canonical_id(self) -> None:
+        """Self-healing migration: add + backfill the ``canonical_id`` column.
+
+        Expand-Contract PR2 (issue #2207). Mirrors the
+        ``_ensure_decision_signal_profile_schema`` 6-step pattern:
+
+        1. SQLite-only (non-SQLite engines rely on ``Base.metadata.create_all``).
+        2. inspect() whether the ``stock_daily`` table exists at all.
+        3. inspect() whether the ``canonical_id`` column already exists (idempotent).
+        4. ``ALTER TABLE ... ADD COLUMN canonical_id VARCHAR(32)`` (nullable —
+           SQLite can't add NOT NULL/UNIQUE columns via ALTER).
+         5. Backfill existing rows with ``_derive_canonical_id(code)`` in
+            id-batched chunks (5000/batch), using ``WHERE canonical_id IS NULL``
+            so re-runs are safe. ``_derive_canonical_id`` is index-aware: a
+            bare registered index code (e.g. ``000300``) resolves to the index
+            canonical_id (``sh000300``) rather than the stock-path key
+            (``sz000300``), preventing same-index split across buckets.
+            Function-level lazy import keeps the storage layer free of a
+            circular import on ``src.services.stock_list_parser``.
+        6. Create a plain (non-unique) index ``ix_stock_daily_canonical_id`` so
+           historical alias rows sharing one canonical_id + date can coexist (AC 9).
+
+        The ``(code, date)`` unique constraint ``uix_code_date`` is untouched —
+        read paths keep using the ``code`` column (AC 4).
+        """
+
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        if not inspector.has_table(StockDaily.__tablename__):
+            return
+
+        try:
+            existing = {
+                column["name"]
+                for column in inspector.get_columns(StockDaily.__tablename__)
+            }
+        except Exception as exc:
+            logger.error(
+                "[StockDaily] failed to inspect canonical_id column; "
+                "canonical_id migration cannot continue safely: %s",
+                exc,
+            )
+            raise
+
+        if "canonical_id" not in existing:
+            try:
+                with self._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE {StockDaily.__tablename__} "
+                        "ADD COLUMN canonical_id VARCHAR(32)"
+                    )
+            except OperationalError as exc:
+                if not self._is_sqlite_duplicate_column_error(exc, "canonical_id"):
+                    raise
+
+        self._backfill_stock_daily_canonical_id()
+        self._ensure_stock_daily_canonical_id_index()
+
+    def _ensure_stock_daily_canonical_id_index(self) -> None:
+        """Create the plain ``ix_stock_daily_canonical_id`` index (idempotent)."""
+
+        with self._engine.begin() as connection:
+            connection.exec_driver_sql(
+                f"CREATE INDEX IF NOT EXISTS ix_stock_daily_canonical_id "
+                f"ON {StockDaily.__tablename__} (canonical_id)"
+            )
+
+        try:
+            actual_indexes = {
+                index["name"]: index["column_names"]
+                for index in inspect(self._engine).get_indexes(
+                    StockDaily.__tablename__
+                )
+            }
+        except Exception as exc:
+            logger.error(
+                "[StockDaily] failed to inspect canonical_id index; "
+                "canonical_id migration cannot verify index safely: %s",
+                exc,
+            )
+            raise
+        if actual_indexes.get("ix_stock_daily_canonical_id") != ["canonical_id"]:
+            raise RuntimeError(
+                "canonical_id index verification failed: "
+                f"index=ix_stock_daily_canonical_id "
+                f"expected=['canonical_id'] "
+                f"actual={actual_indexes.get('ix_stock_daily_canonical_id')}"
+            )
+
+    def _derive_canonical_id(self, code: str) -> Optional[str]:
+        """Derive a Phase 1 ``canonical_id`` for ``code``, index-aware.
+
+        Closes review blocker ``OR-COR-4f9ffc38``: when a bare code hits the
+        index registry (``parse_analysis_target(code).matched_index is not
+        None``) we unify to the index's ``canonical_id`` so the same
+        underlying index doesn't split across buckets — e.g. bare ``000300``
+        resolves to ``sh000300`` (the CSI-300 index canonical_id) instead of
+        ``sz000300`` (the stock-path canonical_id the classifier would
+        synthesise for a 6-digit ``0``-prefixed code). When no index is
+        matched, the parser's stock/explicit-index ``canonical_id`` is
+        returned unchanged.
+
+        Lazy-imports ``parse_analysis_target`` inside the method (the parser
+        module transitively touches the storage layer) and degrades to
+        ``None`` on import failure or empty canonical_id so callers can
+        persist NULL (D1) without raising.
+        """
+        try:
+            from src.services.stock_list_parser import parse_analysis_target
+        except Exception as exc:
+            logger.warning(
+                "_derive_canonical_id: cannot import parse_analysis_target "
+                "for code=%r: %s — returning None",
+                code, exc,
+            )
+            return None
+        target = parse_analysis_target(code)
+        if target.matched_index is not None:
+            return target.matched_index.canonical_id or None
+        return target.canonical_id or None
+
+    def _backfill_stock_daily_canonical_id(self) -> None:
+        """Backfill ``canonical_id`` for existing rows using the Phase 1 parser.
+
+        Idempotent: only rows with ``canonical_id IS NULL`` are considered, and
+        each UPDATE is guarded by the same null condition. Backfilled in
+        id-ordered batches of 5000 so large legacy tables stay within SQLite's
+        per-statement limits.
+
+        The batch scan advances a monotonic ``id`` cursor (not "re-select NULL
+        rows") so a row whose derivation fails can never trap this loop: it is
+        skipped past in this run and naturally retried on next startup while
+        its ``canonical_id`` is still NULL.
+
+        Derivation is index-aware via :meth:`_derive_canonical_id` so a bare
+        index code (e.g. ``000300``) backfills to the index canonical_id
+        (``sh000300``) rather than the stock-path canonical_id (``sz000300``).
+        """
+
+        _BATCH_SIZE = 5000
+        total_backfilled = 0
+        total_skipped = 0
+        last_id = 0
+
+        while True:
+            with self._engine.begin() as connection:
+                rows = connection.execute(
+                    text(
+                        f"SELECT id, code FROM {StockDaily.__tablename__} "
+                        "WHERE canonical_id IS NULL AND id > :last_id "
+                        f"ORDER BY id LIMIT {_BATCH_SIZE}"
+                    ),
+                    {"last_id": last_id},
+                ).fetchall()
+
+            if not rows:
+                break
+
+            with self._engine.begin() as connection:
+                for row_id, code in rows:
+                    # Always advance the cursor — even when this row's
+                    # derivation fails below — so the batch scan terminates.
+                    last_id = row_id
+                    derived = None
+                    try:
+                        derived = self._derive_canonical_id(code)
+                    except Exception as exc:
+                        # D1 decision: parser failure degrades to NULL rather
+                        # than crashing the whole migration. The row keeps
+                        # ``canonical_id IS NULL`` and will be retried on the
+                        # next startup; we don't raise and don't re-loop here.
+                        logger.warning(
+                            "[StockDaily] canonical_id derivation failed for "
+                            "code=%r (id=%s): %s — leaving NULL",
+                            code, row_id, exc,
+                        )
+                        total_skipped += 1
+                        continue
+
+                    if not derived:
+                        # Parser returned an empty canonical_id (None / '')
+                        # without raising — nothing meaningful to write. Skip
+                        # so the row is not falsely counted as backfilled and
+                        # no empty string is persisted as a stable key.
+                        total_skipped += 1
+                        continue
+
+                    result = connection.execute(
+                        text(
+                            f"UPDATE {StockDaily.__tablename__} "
+                            "SET canonical_id = :canonical_id "
+                            "WHERE id = :row_id AND canonical_id IS NULL"
+                        ),
+                        {"canonical_id": derived, "row_id": row_id},
+                    )
+                    if result.rowcount == 1:
+                        total_backfilled += 1
+                    elif result.rowcount == 0:
+                        # Lost the race with a concurrent writer — safe to skip,
+                        # the row is now non-null.
+                        total_skipped += 1
+                    else:
+                        raise RuntimeError(
+                            "canonical_id backfill updated an unexpected number "
+                            f"of rows for id={row_id}: {result.rowcount}"
+                        )
+
+        logger.info(
+            "[StockDaily] canonical_id backfill stats: backfilled_count=%s "
+            "skipped_count=%s",
+            total_backfilled,
+            total_skipped,
         )
 
     def _ensure_intelligence_items_unique_index(self) -> None:
@@ -2078,6 +2462,174 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             except Exception:
                 return None
 
+    def save_screening_run(self, payload: Dict[str, Any]) -> int:
+        """Persist one completed screening response without blocking screening on DB errors."""
+        run_id = str(payload.get("run_id") or "").strip()
+        if not run_id:
+            return 0
+        normalized_payload = dict(payload)
+        warnings = self._screening_warning_values(normalized_payload)
+        normalized_payload["warnings"] = warnings
+
+        values = {
+            "strategy": str(normalized_payload.get("strategy") or "").strip() or "unknown",
+            "market": str(normalized_payload.get("market") or "").strip() or "cn",
+            "snapshot_source": str(normalized_payload.get("snapshot_source") or "").strip() or None,
+            "snapshot_count": self._optional_int(normalized_payload.get("snapshot_count")),
+            "after_filter_count": self._optional_int(normalized_payload.get("after_filter_count")),
+            "candidate_count": self._optional_int(normalized_payload.get("candidate_count")) or 0,
+            "llm_ranked": self._optional_bool(normalized_payload.get("llm_ranked")),
+            "daily_enriched": self._optional_bool(normalized_payload.get("daily_enriched")),
+            "source_errors_json": self._safe_json_dumps(normalized_payload.get("source_errors") or []),
+            "warnings_json": self._safe_json_dumps(warnings),
+            "result_json": self._safe_json_dumps(normalized_payload),
+        }
+
+        try:
+            def _write(session: Session) -> int:
+                row = session.execute(
+                    select(ScreeningRun).where(ScreeningRun.run_id == run_id)
+                ).scalar_one_or_none()
+                if row is None:
+                    session.add(ScreeningRun(run_id=run_id, **values))
+                else:
+                    for key, value in values.items():
+                        setattr(row, key, value)
+                return 1
+
+            return self._run_write_transaction(
+                f"save_screening_run[{run_id}]",
+                _write,
+            )
+        except Exception as exc:
+            logger.warning(
+                "选股运行历史写入失败（fail-open）: run_id=%s err=%s",
+                run_id,
+                exc,
+            )
+            return 0
+
+    def list_screening_runs(
+        self,
+        *,
+        limit: int = 20,
+        strategy: Optional[str] = None,
+        market: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List recent screening runs as compact summaries."""
+        normalized_limit = max(0, min(int(limit), 100))
+        if normalized_limit <= 0:
+            return []
+
+        with self.get_session() as session:
+            statement = select(ScreeningRun)
+            if strategy:
+                statement = statement.where(ScreeningRun.strategy == str(strategy).strip())
+            if market:
+                statement = statement.where(ScreeningRun.market == str(market).strip())
+            rows = session.execute(
+                statement.order_by(desc(ScreeningRun.created_at), desc(ScreeningRun.id)).limit(normalized_limit)
+            ).scalars().all()
+            return [self._screening_run_to_dict(row, include_result=False) for row in rows]
+
+    def get_screening_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """Load a completed screening run by its stable run id."""
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            return None
+        with self.get_session() as session:
+            row = session.execute(
+                select(ScreeningRun).where(ScreeningRun.run_id == normalized_run_id)
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return self._screening_run_to_dict(row, include_result=True)
+
+    @staticmethod
+    def _optional_int(value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _optional_bool(value: Any) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+            return None
+        return bool(value)
+
+    @staticmethod
+    def _screening_json_list(value: Optional[str]) -> List[Any]:
+        try:
+            decoded = json.loads(value or "[]")
+        except (TypeError, ValueError):
+            return []
+        return decoded if isinstance(decoded, list) else []
+
+    @staticmethod
+    def _screening_text_list(value: Any) -> List[str]:
+        if isinstance(value, list):
+            result = []
+            for item in value:
+                text = str(item or "").strip()
+                if text:
+                    result.append(text)
+            return result
+        text = str(value or "").strip()
+        return [text] if text else []
+
+    @classmethod
+    def _screening_warning_values(cls, payload: Dict[str, Any]) -> List[str]:
+        warnings: List[str] = []
+        seen: set[str] = set()
+        for key in ("warnings", "degradation"):
+            for item in cls._screening_text_list(payload.get(key)):
+                if item in seen:
+                    continue
+                seen.add(item)
+                warnings.append(item)
+        return warnings
+
+    @classmethod
+    def _screening_run_to_dict(
+        cls,
+        row: ScreeningRun,
+        *,
+        include_result: bool,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "run_id": row.run_id,
+            "strategy": row.strategy,
+            "market": row.market,
+            "snapshot_source": row.snapshot_source or "",
+            "snapshot_count": row.snapshot_count,
+            "after_filter_count": row.after_filter_count,
+            "candidate_count": row.candidate_count,
+            "llm_ranked": row.llm_ranked,
+            "daily_enriched": row.daily_enriched,
+            "source_errors": cls._screening_json_list(row.source_errors_json),
+            "warnings": cls._screening_json_list(row.warnings_json),
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+        if include_result:
+            try:
+                result = json.loads(row.result_json or "{}")
+            except (TypeError, ValueError):
+                result = {}
+            payload["result"] = result if isinstance(result, dict) else {}
+        return payload
+
     def get_recent_news(self, code: str, days: int = 7, limit: int = 20) -> List[NewsIntel]:
         """
         获取指定股票最近 N 天的新闻情报
@@ -2429,7 +2981,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         if not ids:
             return 0
 
-        with self.session_scope() as session:
+        def _write(session: Session) -> int:
             existing_ids = sorted(
                 session.execute(
                     select(AnalysisHistory.id).where(AnalysisHistory.id.in_(ids))
@@ -2465,10 +3017,35 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             session.execute(
                 delete(BacktestResult).where(BacktestResult.analysis_history_id.in_(existing_ids))
             )
+            linked_skill_sample_ids = sorted(
+                session.execute(
+                    select(SkillOpinionSampleRecord.id).where(
+                        SkillOpinionSampleRecord.analysis_history_id.in_(existing_ids)
+                    )
+                ).scalars().all()
+            )
+            if linked_skill_sample_ids:
+                session.execute(
+                    delete(SkillOpinionOutcomeRecord).where(
+                        SkillOpinionOutcomeRecord.skill_opinion_sample_id.in_(
+                            linked_skill_sample_ids
+                        )
+                    )
+                )
+            session.execute(
+                delete(SkillOpinionSampleRecord).where(
+                    SkillOpinionSampleRecord.analysis_history_id.in_(existing_ids)
+                )
+            )
             result = session.execute(
                 delete(AnalysisHistory).where(AnalysisHistory.id.in_(existing_ids))
             )
             return result.rowcount or 0
+
+        return self._run_write_transaction(
+            "delete analysis history records",
+            _write,
+        )
 
     def get_distinct_stocks_from_history(
         self,
@@ -2604,7 +3181,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         self, 
         df: pd.DataFrame, 
         code: str,
-        data_source: str = "Unknown"
+        data_source: str = "Unknown",
+        canonical_id: Optional[str] = None,
     ) -> int:
         """
         保存日线数据到数据库
@@ -2613,11 +3191,17 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         - 按 `(code, date)` 做批量 UPSERT，已存在记录会覆盖更新
         - 同一批次内若存在重复日期，以最后一条记录为准
         - SQLite 分支按 chunk 写入以避免绑定参数上限
+        - ``canonical_id``（Expand-Contract PR2）：显式传入则双写；
+          未传（``None``）时用 ``_derive_canonical_id(code)`` 延迟推导
+          （index-aware：裸指数码命中注册表时统一到指数 canonical_id），
+          推导失败写 NULL 降级（D1）。
         
         Args:
             df: 包含日线数据的 DataFrame
             code: 股票代码
             data_source: 数据来源名称
+            canonical_id: Phase 1 前缀格式稳定键（如 ``sh000300``）；为 ``None``
+                时自动推导。
             
         Returns:
             本次实际新增的记录数（不含更新）
@@ -2625,6 +3209,23 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         if df is None or df.empty:
             logger.warning(f"保存数据为空，跳过 {code}")
             return 0
+
+        # D1: canonical_id=None → derive via the Phase 1 parser; on failure
+        # degrade to NULL (do NOT raise — read path still uses ``code``).
+        # Empty string is treated like None (never persisted as a key).
+        # Derivation is index-aware (OR-COR-4f9ffc38): a bare index code
+        # (e.g. ``000300``) resolves to the index canonical_id (``sh000300``)
+        # rather than the stock-path canonical_id (``sz000300``).
+        if not canonical_id:
+            try:
+                canonical_id = self._derive_canonical_id(code)
+            except Exception as exc:
+                logger.warning(
+                    "save_daily_data: canonical_id derivation failed for "
+                    "code=%r: %s — writing NULL",
+                    code, exc,
+                )
+                canonical_id = None
 
         now = datetime.now()
         records_by_date: Dict[date, Dict[str, Any]] = {}
@@ -2645,6 +3246,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 'ma20': self._normalize_sql_value(row.get('ma20')),
                 'volume_ratio': self._normalize_sql_value(row.get('volume_ratio')),
                 'data_source': data_source,
+                'canonical_id': canonical_id,
                 'created_at': now,
                 'updated_at': now,
             }
@@ -2658,7 +3260,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         def _write(session: Session) -> int:
             if self._is_sqlite_engine:
                 # SQLite has a per-statement bind-parameter limit (commonly 999).
-                # Each record has ~15 columns, so chunk upserts to stay within bounds.
+                # Each record has ~17 columns, so chunk upserts to stay within bounds.
                 _SQLITE_CHUNK = 50
                 # `_run_write_transaction()` opens SQLite writes with
                 # `BEGIN IMMEDIATE`, so existence checks and upsert execute
@@ -2702,6 +3304,12 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                                 'ma20': excluded.ma20,
                                 'volume_ratio': excluded.volume_ratio,
                                 'data_source': excluded.data_source,
+                                # D1 degrade: never overwrite a previously
+                                # backfilled non-NULL canonical_id with NULL.
+                                'canonical_id': func.coalesce(
+                                    excluded.canonical_id,
+                                    StockDaily.canonical_id,
+                                ),
                                 'updated_at': excluded.updated_at,
                             },
                         )
@@ -2738,6 +3346,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                     existing.ma20 = record['ma20']
                     existing.volume_ratio = record['volume_ratio']
                     existing.data_source = record['data_source']
+                    if record['canonical_id'] is not None:
+                        existing.canonical_id = record['canonical_id']
                     existing.updated_at = record['updated_at']
                 return new_count
 
@@ -2934,6 +3544,54 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             session.add(msg)
             session.flush()
             return int(msg.id)
+
+    def save_conversation_user_turn(
+        self,
+        session_id: str,
+        content: str,
+        selected_skill_ids: Optional[List[str]] = None,
+    ) -> int:
+        """Persist a user message and an optional session Skill selection atomically."""
+        with self.session_scope() as session:
+            msg = ConversationMessage(
+                session_id=session_id,
+                role="user",
+                content=content,
+            )
+            session.add(msg)
+            session.flush()
+
+            if selected_skill_ids is not None:
+                now = datetime.now()
+                values = {
+                    "session_id": session_id,
+                    "selected_skill_ids_json": json.dumps(selected_skill_ids, ensure_ascii=False),
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                stmt = sqlite_insert(ConversationSessionState).values(**values)
+                session.execute(
+                    stmt.on_conflict_do_update(
+                        index_elements=["session_id"],
+                        set_={
+                            "selected_skill_ids_json": values["selected_skill_ids_json"],
+                            "updated_at": now,
+                        },
+                    )
+                )
+
+            return int(msg.id)
+
+    def get_conversation_session_selected_skill_ids(
+        self,
+        session_id: str,
+    ) -> Optional[List[str]]:
+        """Return the saved Skill selection, or None when the session has no state row."""
+        with self.session_scope() as session:
+            state = session.get(ConversationSessionState, session_id)
+            if state is None:
+                return None
+            return json.loads(state.selected_skill_ids_json)
 
     def get_conversation_history(self, session_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         """
@@ -3275,6 +3933,11 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             删除的消息数
         """
         with self.session_scope() as session:
+            session.execute(
+                delete(ConversationSessionState).where(
+                    ConversationSessionState.session_id == session_id
+                )
+            )
             session.execute(
                 delete(AgentProviderTurn).where(
                     AgentProviderTurn.session_id == session_id

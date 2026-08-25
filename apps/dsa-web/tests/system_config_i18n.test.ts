@@ -70,6 +70,7 @@ const requiredLocalizedKeys = [
   'NOTIFICATION_MIN_SEVERITY',
   'NOTIFICATION_DAILY_DIGEST_ENABLED',
   'SCHEDULE_ENABLED',
+  'DSA_RUNTIME_SCHEDULER_TIMEOUT_SECONDS',
   'SCHEDULE_RUN_IMMEDIATELY',
   'TRADING_DAY_CHECK_ENABLED',
   'WEBUI_HOST',
@@ -118,6 +119,20 @@ describe('systemConfigI18n required key coverage', () => {
     expect(en?.summary).toContain('HMAC');
     expect(en?.notes?.join(' ')).toContain('Do not');
   });
+
+  it('documents the runtime scheduler timeout in both UI languages', () => {
+    const zh = getSettingsHelpContent('settings.system.schedule', undefined, 'zh-CN');
+    const en = getSettingsHelpContent('settings.system.schedule', undefined, 'en');
+    const zhText = JSON.stringify(zh);
+    const enText = JSON.stringify(en);
+
+    expect(zhText).toContain('DSA_RUNTIME_SCHEDULER_TIMEOUT_SECONDS');
+    expect(zhText).toContain('2700');
+    expect(zhText).toContain('60');
+    expect(enText).toContain('DSA_RUNTIME_SCHEDULER_TIMEOUT_SECONDS');
+    expect(enText).toContain('2700');
+    expect(enText).toContain('60');
+  });
 });
 
 describe('systemConfigI18n option label localization', () => {
@@ -131,6 +146,7 @@ describe('systemConfigI18n option label localization', () => {
     ['REPORT_TYPE', 'brief', undefined, '简报'],
     ['REPORT_LANGUAGE', 'zh', 'Chinese', '中文'],
     ['REPORT_LANGUAGE', 'en', 'English', '英文'],
+    ['REPORT_LANGUAGE', 'ko', 'Korean', '韩文'],
     ['NOTIFICATION_MIN_SEVERITY', '', 'Not set', '未设置'],
     ['NOTIFICATION_MIN_SEVERITY', 'info', 'info', '信息'],
     ['NOTIFICATION_MIN_SEVERITY', 'warning', 'warning', '警告'],

@@ -12,8 +12,10 @@ A股自选股智能分析系统 - 核心分析流水线
 """
 
 import logging
+import inspect
 import threading
 import time
+from pathlib import Path
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -37,6 +39,7 @@ from src.analyzer import (
     stabilize_decision_with_structure,
 )
 from src.notification import NotificationService, NotificationChannel
+from src.schemas.decision_action import normalize_decision_action
 from src.report_language import (
     get_placeholder_text,
     get_unknown_text,
@@ -51,6 +54,18 @@ from src.analysis_context_pack_prompt import format_analysis_context_pack_prompt
 from src.analysis_context_pack_overview import render_analysis_context_pack_overview
 from src.market_phase_summary import MARKET_PHASE_SUMMARY_KEY, render_market_phase_summary
 from src.daily_market_context_guardrail import apply_daily_market_context_guardrail
+from src.agent.final_explanation import (
+    PipelineActionAdjustment,
+    build_pipeline_final_explanation,
+    capture_pipeline_action_adjustment,
+)
+from src.agent.news_evidence import (
+    activate_news_evidence_scope,
+    get_current_news_evidence,
+    reset_news_evidence_scope,
+)
+from src.services.empty_news import news_evidence_present
+from src.formatters import strip_hidden_markdown_metadata
 from src.phase_decision_guardrail import apply_phase_decision_guardrails
 from src.services.daily_market_context import (
     DailyMarketContext,
@@ -76,7 +91,10 @@ from src.services.run_diagnostics import (
     reset_run_diagnostic_context,
     sanitize_diagnostic_text,
 )
-from src.services.decision_signal_extractor import extract_and_persist_from_analysis_result
+from src.services.decision_signal_extractor import (
+    extract_and_persist_from_analysis_result,
+    resolve_decision_signal_action_fields,
+)
 from src.services.decision_signal_summary import summarize_decision_signal
 from src.enums import ReportType
 from src.stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult
@@ -92,6 +110,30 @@ from bot.models import BotMessage
 
 
 logger = logging.getLogger(__name__)
+
+
+def _share_image_payload(result: Any) -> Optional[Dict[str, Any]]:
+    """Return structured poster data when the result exposes the real contract."""
+
+    to_dict = getattr(result, "to_dict", None)
+    if not callable(to_dict):
+        return None
+    try:
+        payload = to_dict()
+    except Exception as exc:
+        logger.debug("构建分享图片结构化数据失败，回退 Markdown: %s", exc)
+        return None
+    return payload if isinstance(payload, dict) and payload else None
+
+
+def _supports_explicit_keyword(callable_obj: Any, keyword: str) -> bool:
+    """Avoid breaking custom notifier overrides that predate an optional kwarg."""
+
+    try:
+        return keyword in inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return False
+
 
 # 防御性 guard：当实例绕过 __init__（如测试中 __new__）构造时，
 # double-check 初始化 _single_stock_notify_lock 仍然线程安全。
@@ -236,6 +278,8 @@ class StockAnalysisPipeline:
         self._daily_market_context_service_lock = threading.Lock()
         self._concept_rankings_cache_lock = threading.Lock()
         self._concept_rankings_cache: Dict[str, Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]] = {}
+        self._last_local_report_path: Optional[str] = None
+        self._last_local_report_error: Optional[str] = None
         
         # 初始化搜索服务（可选，初始化失败不应阻断主分析流程）
         try:
@@ -585,6 +629,11 @@ class StockAnalysisPipeline:
             if self.search_service is not None and self.search_service.is_available:
                 logger.info(f"{stock_name}({code}) 开始多维度情报搜索...")
 
+                # 检索已发起：此后即使一条都没拿到，也是「执行了但零命中」而非
+                # 「未执行检索」。若停留在 None，搜索源全线失败这一最该提示的场景
+                # 反而不会提示。
+                news_result_count = 0
+
                 # 使用多维度搜索（最多5次搜索）
                 intel_results = self.search_service.search_comprehensive_intel(
                     stock_code=code,
@@ -621,11 +670,13 @@ class StockAnalysisPipeline:
                 logger.info(f"{stock_name}({code}) 搜索服务不可用，跳过情报搜索")
 
             # Step 4.5: Social sentiment intelligence (US stocks only)
+            social_evidence_context: Optional[str] = None
             if self.social_sentiment_service is not None and self.social_sentiment_service.is_available and is_us_stock_code(code):
                 try:
                     social_context = self.social_sentiment_service.get_social_context(code)
                     if social_context:
                         logger.info(f"{stock_name}({code}) Social sentiment data retrieved")
+                        social_evidence_context = social_context
                         if news_context:
                             news_context = news_context + "\n\n" + social_context
                         else:
@@ -751,6 +802,18 @@ class StockAnalysisPipeline:
                     analysis_context_pack_summary=analysis_context_pack_summary,
                 )
                 llm_duration_ms = int((time.monotonic() - llm_started_at) * 1000)
+                if result is not None:
+                    # 交给展示层区分「未配置渠道」「检索零命中」和「正常命中」。
+                    # 该值此前只进了诊断快照，报告层拿不到。
+                    result.news_result_count = news_result_count
+                    # 三路来源逐个登记，不看拼好的 news_context 整段：
+                    # format_intel_report() 零命中时仍输出占位文本，整段永远非空，
+                    # 拿它判定会把「搜了但一条没拿到」误判成有证据。
+                    result.news_evidence_present = news_evidence_present(
+                        news_result_count,
+                        social_evidence_context,
+                        persisted_intelligence_context,
+                    )
                 record_llm_run(
                     success=bool(result and getattr(result, "success", True)),
                     model=getattr(result, "model_used", None) if result else None,
@@ -1364,10 +1427,12 @@ class StockAnalysisPipeline:
             # Agent path: inject social sentiment as news_context so both
             # executor (_build_user_message) and orchestrator (ctx.set_data)
             # can consume it through the existing news_context channel
+            social_evidence_context: Optional[str] = None
             if self.social_sentiment_service is not None and self.social_sentiment_service.is_available and is_us_stock_code(code):
                 try:
                     social_context = self.social_sentiment_service.get_social_context(code)
                     if social_context:
+                        social_evidence_context = social_context
                         existing = initial_context.get("news_context")
                         if existing:
                             initial_context["news_context"] = existing + "\n\n" + social_context
@@ -1424,6 +1489,11 @@ class StockAnalysisPipeline:
             else:
                 message = f"请分析股票 {code} ({stock_name})，并生成决策仪表盘报告。"
             llm_started_at = time.monotonic()
+            # Agent 自己调用搜索工具取证，所以披露计数只能来自这些工具的真实返回；
+            # 分析结束后补打的 search_stock_news() 与 Agent 消费的证据无关。
+            # 累加器对象在这里持有引用，reset 之后仍可安全读取。
+            news_evidence_token = activate_news_evidence_scope()
+            news_evidence = get_current_news_evidence()
             try:
                 record_llm_run_started(
                     model=getattr(self.config, "agent_litellm_model", None),
@@ -1440,6 +1510,8 @@ class StockAnalysisPipeline:
                     error_message=exc,
                 )
                 raise
+            finally:
+                reset_news_evidence_scope(news_evidence_token)
 
             # 转换为 AnalysisResult
             result = self._agent_result_to_analysis_result(
@@ -1450,6 +1522,24 @@ class StockAnalysisPipeline:
                 query_id,
                 trend_result=trend_result,
             )
+
+            # 三态计数取自 Agent 实际消费的搜索工具结果：渠道不可用为 None（未执行
+            # 检索），渠道可用则从 0 起步、拿到多少算多少。
+            if result is not None and news_evidence is not None:
+                result.news_result_count = news_evidence.resolve(
+                    search_available=bool(
+                        self.search_service is not None
+                        and self.search_service.is_available
+                    ),
+                )
+                # 与普通路径同样按来源逐个登记：Agent 运行期自己搜到的条数、注入的
+                # 社交情绪、注入的本地资讯池。这条路径不经过 format_intel_report()，
+                # 但仍不传拼好的整段，避免以后有人往里加会造占位文本的来源。
+                result.news_evidence_present = news_evidence_present(
+                    result.news_result_count,
+                    social_evidence_context,
+                    persisted_intelligence_context,
+                )
             record_llm_run(
                 success=bool(result and getattr(result, "success", True)),
                 model=getattr(result, "model_used", None) if result else getattr(agent_result, "model", None),
@@ -1488,13 +1578,53 @@ class StockAnalysisPipeline:
 
             # price_position fallback (same as non-agent path Step 7.7)
             if result:
+                pipeline_adjustments: list[PipelineActionAdjustment] = []
+                runtime_facts = getattr(agent_result, "runtime_facts", None)
+                pipeline_start_signal = getattr(result, "decision_type", "hold")
+                risk_application = (
+                    getattr(runtime_facts, "risk_override_application", None)
+                    if runtime_facts is not None
+                    else None
+                )
+                if risk_application is not None:
+                    pipeline_start_signal = risk_application.post_risk_signal.value
+                initial_action_advice = getattr(result, "operation_advice", None)
+                self._refresh_decision_action_for_final_result(
+                    result,
+                    report_type=report_type.value,
+                    previous_operation_advice=initial_action_advice,
+                )
+                pipeline_start_action = normalize_decision_action(
+                    getattr(result, "action", None)
+                )
+                action_chain_valid = pipeline_start_action is not None
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
                 realtime_data = initial_context.get("realtime_quote", {})
                 if isinstance(realtime_data, dict):
                     result.current_price = realtime_data.get("price")
                     result.change_pct = realtime_data.get("change_pct")
-                action_source_advice = getattr(result, "operation_advice", None)
+                action_before_guardrail = getattr(result, "action", None)
+                advice_before_guardrail = getattr(result, "operation_advice", None)
                 stabilize_decision_with_structure(result, trend_result, fundamental_context)
+                self._refresh_decision_action_for_final_result(
+                    result,
+                    report_type=report_type.value,
+                    previous_operation_advice=advice_before_guardrail,
+                )
+                action_after_guardrail = normalize_decision_action(
+                    getattr(result, "action", None)
+                )
+                if action_chain_valid and action_after_guardrail is not None:
+                    capture_pipeline_action_adjustment(
+                        pipeline_adjustments,
+                        source="structure_and_fundamentals",
+                        before=action_before_guardrail,
+                        after=action_after_guardrail,
+                    )
+                else:
+                    action_chain_valid = False
+                action_before_guardrail = getattr(result, "action", None)
+                advice_before_guardrail = getattr(result, "operation_advice", None)
                 adjustments = apply_phase_decision_guardrails(
                     result,
                     market_phase_summary=market_phase_summary,
@@ -1504,6 +1634,25 @@ class StockAnalysisPipeline:
                 )
                 if adjustments:
                     logger.info("[phase_decision_guardrail] Applied agent adjustments for %s: %s", code, adjustments)
+                self._refresh_decision_action_for_final_result(
+                    result,
+                    report_type=report_type.value,
+                    previous_operation_advice=advice_before_guardrail,
+                )
+                action_after_guardrail = normalize_decision_action(
+                    getattr(result, "action", None)
+                )
+                if action_chain_valid and action_after_guardrail is not None:
+                    capture_pipeline_action_adjustment(
+                        pipeline_adjustments,
+                        source="market_phase",
+                        before=action_before_guardrail,
+                        after=action_after_guardrail,
+                    )
+                else:
+                    action_chain_valid = False
+                action_before_guardrail = getattr(result, "action", None)
+                advice_before_guardrail = getattr(result, "operation_advice", None)
                 market_context_adjustments = apply_daily_market_context_guardrail(
                     result,
                     daily_market_context=initial_context.get("daily_market_context"),
@@ -1516,17 +1665,54 @@ class StockAnalysisPipeline:
                         code,
                         market_context_adjustments,
                     )
+                self._refresh_decision_action_for_final_result(
+                    result,
+                    report_type=report_type.value,
+                    previous_operation_advice=advice_before_guardrail,
+                )
+                action_after_guardrail = normalize_decision_action(
+                    getattr(result, "action", None)
+                )
+                if action_chain_valid and action_after_guardrail is not None:
+                    capture_pipeline_action_adjustment(
+                        pipeline_adjustments,
+                        source="daily_market_context",
+                        before=action_before_guardrail,
+                        after=action_after_guardrail,
+                    )
+                else:
+                    action_chain_valid = False
                 if isinstance(fundamental_context, dict):
                     result.fundamental_context = fundamental_context
                 if isinstance(market_structure_context, dict):
                     result.market_structure_context = market_structure_context
                 result.market_phase_summary = market_phase_summary
                 result.analysis_context_pack_overview = analysis_context_pack_overview
-                self._refresh_decision_action_for_final_result(
-                    result,
-                    report_type=report_type.value,
-                    previous_operation_advice=action_source_advice,
-                )
+                final_action = normalize_decision_action(getattr(result, "action", None))
+                if isinstance(result.dashboard, dict):
+                    result.dashboard.pop("agent_disagreement_explanation", None)
+                if (
+                    runtime_facts is not None
+                    and action_chain_valid
+                    and pipeline_start_action is not None
+                    and final_action is not None
+                ):
+                    if not isinstance(result.dashboard, dict):
+                        result.dashboard = {}
+                    result.dashboard["agent_disagreement_explanation"] = (
+                        build_pipeline_final_explanation(
+                            runtime_facts=runtime_facts,
+                            pipeline_start_signal=pipeline_start_signal,
+                            pipeline_start_action=pipeline_start_action,
+                            final_action=final_action,
+                            pipeline_adjustments=pipeline_adjustments,
+                            data_quality=(
+                                analysis_context_pack_overview.get("data_quality")
+                                if isinstance(analysis_context_pack_overview, dict)
+                                else None
+                            ),
+                        )
+                    )
 
             resolved_stock_name = result.name if result and result.name else stock_name
 
@@ -1539,6 +1725,10 @@ class StockAnalysisPipeline:
                         stock_name=resolved_stock_name,
                         max_results=5
                     )
+                    # 这次补查只为持久化新闻情报（Fixes #396），刻意不写
+                    # result.news_result_count：它发生在分析结束之后，与 Agent 实际
+                    # 消费的证据无关，用它做披露判定会两个方向都失真。真正的计数在
+                    # executor.run() 的证据作用域里收集（见上文）。
                     if news_response.success and news_response.results:
                         query_context = self._build_query_context(query_id=query_id)
                         self.db.save_news_intel(
@@ -1590,6 +1780,12 @@ class StockAnalysisPipeline:
                         ),
                     )
                     if valid_saved_history_id:
+                        self._persist_skill_opinion_samples_after_history_save(
+                            runtime_facts=getattr(agent_result, "runtime_facts", None),
+                            analysis_history_id=saved_history_id,
+                            stock_code=code,
+                            analysis_context_pack_overview=analysis_context_pack_overview,
+                        )
                         self._extract_decision_signal_after_history_save(
                             result=result,
                             query_id=query_id,
@@ -2000,16 +2196,21 @@ class StockAnalysisPipeline:
         report_type: Any,
         previous_operation_advice: Any,
     ) -> AnalysisResult:
+        # A guardrail may rewrite the advice after the Agent action was parsed;
+        # discard that stale action before using the same resolver as the
+        # downstream DecisionSignal builder.
         previous_advice = str(previous_operation_advice or "").strip()
         current_advice = str(getattr(result, "operation_advice", None) or "").strip()
-        explicit_action = current_advice if previous_advice != current_advice else None
-        return populate_decision_action_fields(
+        if previous_advice != current_advice:
+            result.action = None
+            result.action_label = None
+        fields = resolve_decision_signal_action_fields(
             result,
-            explicit_action=explicit_action,
-            report_type=report_type,
-            use_existing_action=(previous_advice == current_advice),
-            align_with_score=(previous_advice == current_advice),
+            report_type=str(report_type or ""),
         )
+        result.action = fields["action"]
+        result.action_label = fields["action_label"]
+        return result
 
     @staticmethod
     def _agent_dashboard_value(
@@ -2471,6 +2672,42 @@ class StockAnalysisPipeline:
         if self.analysis_skills is not None:
             snapshot["skills"] = list(self.analysis_skills)
         return snapshot
+
+    def _persist_skill_opinion_samples_after_history_save(
+        self,
+        *,
+        runtime_facts: Any,
+        analysis_history_id: int,
+        stock_code: str,
+        analysis_context_pack_overview: Optional[Dict[str, Any]],
+    ) -> None:
+        """Best-effort persistence for valid individual skill opinions."""
+        opinions = getattr(runtime_facts, "skill_opinions", ()) if runtime_facts else ()
+        if not opinions:
+            return
+
+        quality_level = None
+        if isinstance(analysis_context_pack_overview, dict):
+            quality = analysis_context_pack_overview.get("data_quality")
+            if isinstance(quality, dict):
+                quality_level = quality.get("level")
+
+        try:
+            from src.services.skill_opinion_sample_service import SkillOpinionSampleService
+
+            SkillOpinionSampleService(db_manager=self.db).persist(
+                analysis_history_id=analysis_history_id,
+                stock_code=stock_code,
+                opinions=opinions,
+                data_quality_level=quality_level,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Skill opinion sample persistence skipped after history save: "
+                "stock_code=%s error_type=%s",
+                stock_code,
+                type(exc).__name__,
+            )
 
     def _extract_decision_signal_after_history_save(
         self,
@@ -3146,26 +3383,6 @@ class StockAnalysisPipeline:
         fallback_code: Optional[str] = None,
     ) -> None:
         """发送单股通知，供直接单股入口和批量串行推送共用。"""
-        if not self.notifier.is_available():
-            notification_run = self._build_notification_run_snapshot(
-                channel="report",
-                status="not_configured",
-                success=False,
-                attempts=0,
-            )
-            record_notification_run(
-                channel="report",
-                status="not_configured",
-                success=False,
-                attempts=0,
-            )
-            self._refresh_saved_diagnostic_snapshot(
-                result=result,
-                fallback_code=fallback_code,
-                notification_run=notification_run,
-            )
-            return
-
         stock_code = getattr(result, "code", None) or fallback_code or "unknown"
         notify_lock = getattr(self, "_single_stock_notify_lock", None)
         if notify_lock is None:
@@ -3187,14 +3404,46 @@ class StockAnalysisPipeline:
                     report_content = self.notifier.generate_single_stock_report(result)
                     logger.info(f"[{stock_code}] 使用精简报告格式")
 
-                sent = self.notifier.send(
-                    report_content,
-                    email_stock_codes=[stock_code],
-                    route_type="report",
-                    severity="info",
-                    dedup_key=f"report:single:{stock_code}:{report_type.value}",
-                    cooldown_key=f"report:single:{stock_code}:{report_type.value}",
-                )
+                save_report = getattr(self.notifier, "save_report_to_file", None)
+                if callable(save_report):
+                    try:
+                        date_str = datetime.now().strftime('%Y%m%d')
+                        filename = f"report_{date_str}_{stock_code}.md"
+                        filepath = save_report(report_content, filename=filename)
+                        logger.info(f"[{stock_code}] 单股报告已保存到本地: {filepath}")
+                    except Exception as exc:
+                        logger.warning(f"[{stock_code}] 单股报告保存失败: {exc}")
+
+                if not self.notifier.is_available():
+                    notification_run = self._build_notification_run_snapshot(
+                        channel="report",
+                        status="not_configured",
+                        success=False,
+                        attempts=0,
+                    )
+                    record_notification_run(
+                        channel="report",
+                        status="not_configured",
+                        success=False,
+                        attempts=0,
+                    )
+                    self._refresh_saved_diagnostic_snapshot(
+                        result=result,
+                        fallback_code=fallback_code,
+                        notification_run=notification_run,
+                    )
+                    return
+
+                send_kwargs: Dict[str, Any] = {
+                    "email_stock_codes": [stock_code],
+                    "route_type": "report",
+                    "severity": "info",
+                    "dedup_key": f"report:single:{stock_code}:{report_type.value}",
+                    "cooldown_key": f"report:single:{stock_code}:{report_type.value}",
+                }
+                if _supports_explicit_keyword(self.notifier.send, "structured_payload"):
+                    send_kwargs["structured_payload"] = _share_image_payload(result)
+                sent = self.notifier.send(report_content, **send_kwargs)
                 notification_run = self._build_notification_run_snapshot(
                     channel="report",
                     status="success" if sent else "failed",
@@ -3238,14 +3487,72 @@ class StockAnalysisPipeline:
         self,
         results: List[AnalysisResult],
         report_type: ReportType = ReportType.SIMPLE,
-    ) -> None:
+    ) -> Optional[str]:
         """保存分析报告到本地文件（与通知推送解耦）"""
+        self._last_local_report_path = None
+        self._last_local_report_error = None
+        report: Optional[str] = None
         try:
             report = self._generate_aggregate_report(results, report_type)
-            filepath = self.notifier.save_report_to_file(report)
-            logger.info(f"决策仪表盘日报已保存: {filepath}")
         except Exception as e:
+            self._last_local_report_error = str(e)
+            logger.error("生成本地报告内容失败: %s", e)
+            return None
+
+        try:
+            filepath = self.notifier.save_report_to_file(report)
+            if filepath:
+                filepath = str(filepath)
+                self._last_local_report_path = filepath
+                logger.info(f"决策仪表盘日报已保存: {filepath}")
+                return filepath
+            self._last_local_report_error = "notifier returned empty report path"
+            logger.error("保存本地报告失败: 通知服务未返回报告路径")
+        except Exception as e:
+            self._last_local_report_error = str(e)
             logger.error(f"保存本地报告失败: {e}")
+
+        logger.warning("尝试回退到本地文件系统路径保存聚合报告")
+        fallback_path = self._fallback_save_report_to_file(report)
+        if fallback_path:
+            self._last_local_report_path = fallback_path
+            self._last_local_report_error = None
+            logger.warning("回退保存本地报告成功: %s", fallback_path)
+            return fallback_path
+        if self._last_local_report_error is None:
+            self._last_local_report_error = "fallback local report save failed"
+            return None
+        return None
+
+    @staticmethod
+    def _default_report_filename() -> str:
+        """Build default local report filename (aligned with notifier defaults)."""
+        date_str = datetime.now().strftime('%Y%m%d')
+        return f"report_{date_str}.md"
+
+    @staticmethod
+    def _report_output_dir() -> Path:
+        """Default report output directory (kept same as NotificationService behavior)."""
+        return Path(__file__).resolve().parents[2] / 'reports'
+
+    @classmethod
+    def _fallback_save_report_to_file(
+        cls,
+        content: str,
+        filename: Optional[str] = None,
+    ) -> Optional[str]:
+        """Persist report content via local filesystem as resilient fallback."""
+        try:
+            reports_dir = cls._report_output_dir()
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            filename = filename or cls._default_report_filename()
+            filepath = reports_dir / filename
+            filepath.write_text(content, encoding='utf-8')
+            logger.info("决策仪表盘日报已回退写入: %s", filepath)
+            return str(filepath)
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            logger.error("回退写入报告失败: %s", exc)
+            return None
 
     def _send_notifications(
         self,
@@ -3396,6 +3703,9 @@ class StockAnalysisPipeline:
                 non_wechat_channels_needing_image = {
                     ch for ch in channels_needing_image if ch != NotificationChannel.WECHAT
                 }
+                single_share_payload = (
+                    _share_image_payload(results[0]) if len(results) == 1 else None
+                )
 
                 def _get_md2img_hint() -> str:
                     try:
@@ -3409,9 +3719,12 @@ class StockAnalysisPipeline:
 
                 image_bytes = None
                 if non_wechat_channels_needing_image:
-                    image_bytes = markdown_to_image(
-                        report, max_chars=self.notifier._markdown_to_image_max_chars
-                    )
+                    image_kwargs: Dict[str, Any] = {
+                        "max_chars": self.notifier._markdown_to_image_max_chars,
+                    }
+                    if single_share_payload is not None:
+                        image_kwargs["structured_payload"] = single_share_payload
+                    image_bytes = markdown_to_image(report, **image_kwargs)
                     if image_bytes:
                         logger.info(
                             "Markdown 已转换为图片，将向 %s 发送图片",
@@ -3435,9 +3748,14 @@ class StockAnalysisPipeline:
                         logger.debug(f"企业微信推送内容:\n{dashboard_content}")
                         wechat_image_bytes = None
                         if NotificationChannel.WECHAT in channels_needing_image:
+                            wechat_image_kwargs: Dict[str, Any] = {
+                                "max_chars": self.notifier._markdown_to_image_max_chars,
+                            }
+                            if single_share_payload is not None:
+                                wechat_image_kwargs["structured_payload"] = single_share_payload
                             wechat_image_bytes = markdown_to_image(
                                 dashboard_content,
-                                max_chars=self.notifier._markdown_to_image_max_chars,
+                                **wechat_image_kwargs,
                             )
                             if wechat_image_bytes is None:
                                 logger.warning(
@@ -3472,7 +3790,8 @@ class StockAnalysisPipeline:
                             if getattr(self.notifier, "_feishu_send_as_file", False):
                                 date_str = datetime.now().strftime('%Y%m%d')
                                 filepath = self.notifier.save_report_to_file(
-                                    report, filename=f"dashboard_{date_str}.md"
+                                    strip_hidden_markdown_metadata(report).strip(),
+                                    filename=f"dashboard_{date_str}.md",
                                 )
                                 return self.notifier.send_feishu_file(filepath)
                             return self.notifier.send_to_feishu(report)
@@ -3532,9 +3851,19 @@ class StockAnalysisPipeline:
                                     grp_report = self._generate_aggregate_report(group_results, report_type)
                                     grp_image_bytes = None
                                     if channel.value in self.notifier._markdown_to_image_channels:
+                                        group_payload = (
+                                            _share_image_payload(group_results[0])
+                                            if len(group_results) == 1
+                                            else None
+                                        )
+                                        group_image_kwargs: Dict[str, Any] = {
+                                            "max_chars": self.notifier._markdown_to_image_max_chars,
+                                        }
+                                        if group_payload is not None:
+                                            group_image_kwargs["structured_payload"] = group_payload
                                         grp_image_bytes = markdown_to_image(
                                             grp_report,
-                                            max_chars=self.notifier._markdown_to_image_max_chars,
+                                            **group_image_kwargs,
                                         )
                                     use_image = self.notifier._should_use_image_for_channel(
                                         channel, grp_image_bytes
@@ -3544,7 +3873,8 @@ class StockAnalysisPipeline:
                                             grp_image_bytes, receivers=receivers
                                         )
                                     return self.notifier.send_to_email(
-                                        grp_report, receivers=receivers
+                                        strip_hidden_markdown_metadata(grp_report).strip(),
+                                        receivers=receivers,
                                     )
 
                                 email_label = (
@@ -3569,7 +3899,9 @@ class StockAnalysisPipeline:
                                 )
                                 if use_image:
                                     return self.notifier._send_email_with_inline_image(image_bytes)
-                                return self.notifier.send_to_email(report)
+                                return self.notifier.send_to_email(
+                                    strip_hidden_markdown_metadata(report).strip()
+                                )
 
                             channel_success, channel_error = _send_channel_safely(
                                 channel.value,

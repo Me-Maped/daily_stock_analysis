@@ -111,6 +111,8 @@ class SystemConfigApiTestCase(unittest.TestCase):
     def test_get_config_keeps_regular_secret_value_unmasked(self) -> None:
         payload = system_config.get_system_config(include_schema=True, service=self.service).model_dump(by_alias=True)
         item_map = {item["key"]: item for item in payload["items"]}
+        self.assertIn("openai", payload["llm_model_providers"])
+        self.assertIn("xai", payload["llm_model_providers"])
         self.assertEqual(item_map["GEMINI_API_KEY"]["value"], "secret-key-value")
         self.assertFalse(item_map["GEMINI_API_KEY"]["is_masked"])
 
@@ -862,6 +864,7 @@ class SystemConfigApiTestCase(unittest.TestCase):
                 "retryable": False,
                 "details": {},
                 "resolved_protocol": "openai",
+                "resolved_api_surface": "responses",
                 "resolved_model": "openai/gpt-4o-mini",
                 "latency_ms": 123,
             },
@@ -870,6 +873,7 @@ class SystemConfigApiTestCase(unittest.TestCase):
                 request=TestLLMChannelRequest(
                     name="primary",
                     protocol="openai",
+                    api_surface="responses",
                     base_url="https://api.example.com/v1",
                     api_key="sk-test",
                     models=["gpt-4o-mini"],
@@ -880,10 +884,12 @@ class SystemConfigApiTestCase(unittest.TestCase):
 
         self.assertTrue(payload["success"])
         self.assertEqual(payload["resolved_model"], "openai/gpt-4o-mini")
+        self.assertEqual(payload["resolved_api_surface"], "responses")
         self.assertEqual(payload["stage"], "chat_completion")
         self.assertEqual(payload["capability_results"], {})
         mock_test.assert_called_once()
         self.assertEqual(mock_test.call_args.kwargs["capability_checks"], ["json", "stream"])
+        self.assertEqual(mock_test.call_args.kwargs["api_surface"], "responses")
 
     def test_test_notification_channel_endpoint_returns_service_payload(self) -> None:
         with patch.object(
@@ -929,7 +935,19 @@ class SystemConfigApiTestCase(unittest.TestCase):
         self.assertEqual(mock_test.call_args.kwargs["channel"], "wechat")
         self.assertEqual(mock_test.call_args.kwargs["timeout_seconds"], 5)
 
-    def test_test_notification_channel_schema_accepts_p6_channels(self) -> None:
+    def test_test_notification_channel_schema_accepts_registered_channels(self) -> None:
+        dingtalk_request = TestNotificationChannelRequest(
+            channel="dingtalk",
+            items=[
+                {
+                    "key": "DINGTALK_WEBHOOK_URL",
+                    "value": "https://oapi.dingtalk.com/robot/send?access_token=test",
+                }
+            ],
+            title="DSA 閫氱煡娴嬭瘯",
+            content="hello",
+            timeout_seconds=5,
+        )
         ntfy_request = TestNotificationChannelRequest(
             channel="ntfy",
             items=[{"key": "NTFY_URL", "value": "https://ntfy.sh/dsa-topic"}],
@@ -948,6 +966,7 @@ class SystemConfigApiTestCase(unittest.TestCase):
             timeout_seconds=5,
         )
 
+        self.assertEqual(dingtalk_request.channel, "dingtalk")
         self.assertEqual(ntfy_request.channel, "ntfy")
         self.assertEqual(gotify_request.channel, "gotify")
 
