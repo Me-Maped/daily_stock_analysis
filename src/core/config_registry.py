@@ -13,7 +13,6 @@ from typing import Any, Dict, List, Optional
 from src.config import (
     AGENT_CONTEXT_COMPRESSION_PROFILES,
     AGENT_MAX_STEPS_DEFAULT,
-    DEFAULT_ALPHASIFT_INSTALL_SPEC,
     DEFAULT_LINK_CRAWL_SOURCES,
 )
 from src.notification_noise import NOTIFICATION_SEVERITIES
@@ -73,6 +72,9 @@ _CATEGORY_DEFINITIONS: List[Dict[str, Any]] = [
 ]
 
 WEB_SETTINGS_HIDDEN_FROM_UI = {
+    # Optional FXMacroData authorization is read from the process environment
+    # when a tool runs; it is not a Web settings or model-input field.
+    "FXMACRODATA_API_KEY",
     "DATABASE_PATH",
     "SQLITE_WAL_ENABLED",
     "SQLITE_BUSY_TIMEOUT_MS",
@@ -81,6 +83,7 @@ WEB_SETTINGS_HIDDEN_FROM_UI = {
     "USE_PROXY",
     "PROXY_HOST",
     "PROXY_PORT",
+    "SEARXNG_TIMEOUT_SECONDS",
 }
 
 _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
@@ -836,6 +839,34 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {},
         "display_order": 18,
     },
+    "MX_APIKEY": {
+        "title": "MiaoXiang (MX_API) API Key",
+        "description": "API key for the optional MiaoXiang supplementary data provider (chip distribution / per-stock capital flow). Only used when the primary eastmoney endpoints fail or are rate-limited; not configured means no behavior change.",
+        "category": "data_source",
+        "data_type": "string",
+        "ui_control": "password",
+        "is_sensitive": True,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": None,
+        "options": [],
+        "validation": {},
+        "display_order": 20,
+    },
+    "MX_PRIORITY": {
+        "title": "MiaoXiang Data Source Priority",
+        "description": "Priority for the MiaoxiangFetcher supplementary data source. Lower numbers are tried earlier. The fetcher never participates in daily K-line fetching.",
+        "category": "data_source",
+        "data_type": "integer",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "6",
+        "options": [],
+        "validation": {"min": 0, "max": 99},
+        "display_order": 21,
+    },
     "TICKFLOW_BATCH_SIZE": {
         "title": "TickFlow Batch Size",
         "description": "Maximum symbols per TickFlow batch request for daily K-lines and realtime quotes.",
@@ -849,6 +880,75 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "options": [],
         "validation": {"min": 1, "max": 500},
         "display_order": 19,
+    },
+    "FUTU_OPEND_HOST": {
+        "title": "Futu OpenD Host",
+        "description": "IPv4 address or IPv4-resolvable hostname of the Futu OpenD service. Leave empty to disable Futu.",
+        "category": "data_source",
+        "data_type": "string",
+        "ui_control": "text",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": None,
+        "options": [],
+        "validation": {},
+        "display_order": 20,
+        "help_key": "settings.data_source.FUTU_OPEND_HOST",
+        "examples": ["FUTU_OPEND_HOST=127.0.0.1"],
+        "docs": [
+            {
+                "label": "数据源配置指南",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/full-guide.md#数据源配置",
+            },
+        ],
+        "warning_codes": [],
+    },
+    "FUTU_OPEND_PORT": {
+        "title": "Futu OpenD Port",
+        "description": "TCP port of the Futu OpenD service.",
+        "category": "data_source",
+        "data_type": "integer",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "11111",
+        "options": [],
+        "validation": {"min": 1, "max": 65535},
+        "display_order": 21,
+        "help_key": "settings.data_source.FUTU_OPEND_PORT",
+        "examples": ["FUTU_OPEND_PORT=11111"],
+        "docs": [
+            {
+                "label": "数据源配置指南",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/full-guide.md#数据源配置",
+            },
+        ],
+        "warning_codes": [],
+    },
+    "FUTU_HK_REALTIME_SOURCE_PRIORITY": {
+        "title": "Futu 港股实时数据源优先级",
+        "description": "港股实时行情优先级，可选 futu、longbridge、akshare、yfinance。未配置 OpenD 时自动跳过 futu。",
+        "category": "data_source",
+        "data_type": "string",
+        "ui_control": "text",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "futu,longbridge,akshare,yfinance",
+        "options": [],
+        "validation": {},
+        "display_order": 22,
+        "help_key": "settings.data_source.FUTU_HK_REALTIME_SOURCE_PRIORITY",
+        "examples": ["FUTU_HK_REALTIME_SOURCE_PRIORITY=futu,longbridge,akshare,yfinance"],
+        "docs": [
+            {
+                "label": "数据源配置指南",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/full-guide.md#数据源配置",
+            },
+        ],
+        "warning_codes": ["provider_priority_order"],
     },
     "STOCK_INDEX_REMOTE_UPDATE_ENABLED": {
         "title": "Remote Stock Index Updates",
@@ -3169,6 +3269,35 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         ],
         "warning_codes": [],
     },
+    "DSA_TIMEOUT_PARTIAL_NOTIFY": {
+        "title": "Timeout Partial Notification",
+        "description": (
+            "After a Web/API runtime scheduler hard timeout, send a partial "
+            "notification for analyses already saved to history."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "true",
+        "options": [],
+        "validation": {},
+        "display_order": 13,
+        "help_key": "settings.system.schedule",
+        "examples": [
+            "DSA_TIMEOUT_PARTIAL_NOTIFY=true",
+            "DSA_TIMEOUT_PARTIAL_NOTIFY=false",
+        ],
+        "docs": [
+            {
+                "label": "Full guide: configuration",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/full-guide.md#其他配置",
+            },
+        ],
+        "warning_codes": [],
+    },
     "HTTP_PROXY": {
         "title": "HTTP Proxy",
         "description": "Optional HTTP proxy endpoint.",
@@ -4752,6 +4881,19 @@ _FIELD_HELP_METADATA: Dict[str, Dict[str, Any]] = {
     "TICKFLOW_PRIORITY": {
         "help_key": "settings.data_source.TICKFLOW_PRIORITY",
         "examples": ["TICKFLOW_PRIORITY=2"],
+        "docs": _DOC_FULL_GUIDE_DATA_SOURCE,
+    },
+    "MX_APIKEY": {
+        "help_key": "settings.data_source.MX_APIKEY",
+        "examples": [
+            "MX_APIKEY=mkt_your_miaoxiang_key",
+        ],
+        "docs": _DOC_FULL_GUIDE_DATA_SOURCE,
+        "warning_codes": ["secret_value"],
+    },
+    "MX_PRIORITY": {
+        "help_key": "settings.data_source.MX_PRIORITY",
+        "examples": ["MX_PRIORITY=6"],
         "docs": _DOC_FULL_GUIDE_DATA_SOURCE,
     },
     "TICKFLOW_KLINE_ADJUST": {

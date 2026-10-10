@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.config import Config, DEFAULT_ALPHASIFT_INSTALL_SPEC, DEFAULT_LINK_CRAWL_SOURCES, setup_env
+from src.config import Config, DEFAULT_LINK_CRAWL_SOURCES, setup_env
 
 
 class ConfigEnvCompatibilityTestCase(unittest.TestCase):

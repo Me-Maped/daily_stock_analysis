@@ -51,10 +51,28 @@ if _packaged_import_probe:
     import sys
 
     try:
-        importlib.import_module(_packaged_import_probe)
+        probe_module = importlib.import_module(_packaged_import_probe)
+        if _packaged_import_probe == "py_mini_racer":
+            # Importing the Python wrapper does not load V8 or its data files.
+            # Exercise the installed runtime to detect missing/mismatched assets.
+            engine = probe_module.MiniRacer()
+            try:
+                if engine.eval("1 + 1") != 2:
+                    raise RuntimeError("MiniRacer JavaScript evaluation failed")
+            finally:
+                close = getattr(engine, "close", None)
+                if callable(close):
+                    close()
+        elif _packaged_import_probe == "src.agent.factory":
+            # Build the agent tool registry so tool modules that read package
+            # data at import time (e.g. the FXMacroData operation catalogue)
+            # are exercised in the frozen artifact.
+            registry = probe_module.get_tool_registry()
+            if not any(name.startswith("fxmacrodata_") for name in registry.list_names()):
+                raise RuntimeError("FXMacroData tools are missing from the agent tool registry")
     except Exception as exc:
         print(
-            f"ERROR: packaged import failed for {_packaged_import_probe}: {exc}",
+            f"ERROR: packaged runtime probe failed for {_packaged_import_probe}: {exc}",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -74,7 +92,12 @@ from src.config import get_config, Config
 from src.logging_config import setup_logging
 from src.brokers.futu.portfolio import FutuPortfolioError
 from data_provider.base import canonical_stock_code
-from src.services.stock_list_parser import split_stock_list
+from src.services.stock_list_parser import (
+    AnalysisTarget,
+    ParseStatus,
+    parse_analysis_target,
+    split_stock_list,
+)
 from src.services.stock_code_utils import resolve_index_stock_code_for_analysis
 
 
@@ -280,12 +303,14 @@ def parse_arguments() -> argparse.Namespace:
   python main.py --debug            # 调试模式
   python main.py --dry-run          # 仅获取数据，不进行 AI 分析
   python main.py --stocks 600519,000001  # 指定分析特定股票
+  python main.py --stocks sh000016,000300.CSI,930955.CSI  # 指定分析已登记指数（sh/sz 前缀或 .CSI alias）
   python main.py --portfolio futu   # 使用 Futu 真实正股持仓（覆盖 --stocks）
   python main.py --no-notify        # 不发送推送通知
   python main.py --check-notify     # 检查通知配置，不发送通知
   python main.py --single-notify    # 启用单股推送模式（每分析完一只立即推送）
   python main.py --schedule         # 启用定时任务模式
   python main.py --market-review    # 仅运行大盘复盘
+  python main.py --etf-rotation     # ETF 轮动：最新信号 + 规则回测报告
         '''
     )
 
@@ -304,7 +329,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '--stocks',
         type=str,
-        help='指定要分析的股票代码，逗号分隔（覆盖配置文件）'
+        help='指定要分析的股票代码，逗号分隔（覆盖配置文件）；支持已登记指数：sh/sz 前缀（如 sh000016）或 .CSI alias（如 000300.CSI、930955.CSI）'
     )
 
     parser.add_argument(
@@ -440,6 +465,13 @@ def parse_arguments() -> argparse.Namespace:
         help='强制回测（即使已有回测结果也重新计算）'
     )
 
+    # === ETF Rotation ===
+    parser.add_argument(
+        '--etf-rotation',
+        action='store_true',
+        help='运行 ETF 轮动：输出最新调仓信号与规则回测报告（不调用 LLM，配置见 ETF_ROTATION_*）'
+    )
+
     return parser.parse_args()
 
 
@@ -471,6 +503,15 @@ def _compute_trading_day_filter(
     filtered_codes = []
     for code in stock_codes:
         mkt = get_market_for_stock(code)
+        if mkt is None:
+            # 指数 code（如 sh000016/csi930955/930955.CSI）的 get_market_for_stock
+            # 返回 None，若直接 fail-open 保留，A 股休市日指数不会被过滤，破坏
+            # per-stock 交易日契约。对市场未知的 code 用 parse_analysis_target
+            # 判型，已登记指数按 market=cn 参与 CN 交易日过滤；仍未知的非指数
+            # code 继续 fail-open 保留。
+            target = parse_analysis_target(code)
+            if target.asset_type == ParseStatus.INDEX:
+                mkt = "cn"
         if mkt in open_markets or mkt is None:
             filtered_codes.append(code)
 
@@ -483,6 +524,46 @@ def _compute_trading_day_filter(
 
     should_skip_all = (not filtered_codes) and (effective_region or '') == ''
     return (filtered_codes, effective_region, should_skip_all)
+
+
+def _classify_stock_list_tokens(
+    tokens: List[str],
+    *,
+    entry_label: str,
+) -> Optional[Tuple[List[str], List[AnalysisTarget]]]:
+    """Classify stock-list tokens into aligned ``(stock_codes, analysis_targets)``.
+
+    Shared by the one-shot ``--stocks`` entry and the GitHub Actions
+    ``STOCK_LIST`` entry: explicit index tokens resolve through
+    ``parse_analysis_target`` and keep their index canonical, while every
+    other token keeps the legacy ``resolve_index_stock_code_for_analysis``
+    path. ``unsupported`` tokens (e.g. an unregistered ``.CSI``) reject the
+    whole run up-front with an explicit error — provider calls are never
+    reached for any token in the batch. Returns ``None`` after logging the
+    rejection, so callers exit without running analysis.
+    """
+    targets = [parse_analysis_target(t) for t in tokens]
+    unsupported = [
+        (token, target.unsupported_reason or "unsupported target")
+        for token, target in zip(tokens, targets)
+        if target.asset_type == ParseStatus.UNSUPPORTED
+    ]
+    if unsupported:
+        token, reason = unsupported[0]
+        logger.error(
+            "%s 包含不支持的目标 %r：%s；本轮不执行任何分析。",
+            entry_label,
+            token,
+            reason,
+        )
+        return None
+    stock_codes = [
+        t.canonical_id
+        if t.asset_type == ParseStatus.INDEX
+        else resolve_index_stock_code_for_analysis(raw)
+        for t, raw in zip(targets, tokens)
+    ]
+    return stock_codes, targets
 
 
 def _run_market_review_with_shared_lock(
@@ -722,12 +803,17 @@ def run_full_analysis(
     stock_codes: Optional[List[str]] = None,
     *,
     raise_errors: bool = False,
+    analysis_targets: Optional[List[AnalysisTarget]] = None,
+    refresh_watchlist: bool = True,
 ) -> bool:
     """
     执行完整的分析流程（个股 + 大盘复盘）
 
     这是定时任务调用的主函数。Futu 持仓解析失败始终传播给调用方；
     ``raise_errors`` 只控制持仓解析成功后的分析流程异常语义。
+    ``analysis_targets`` 与 ``stock_codes`` 对齐，携带结构化分析目标
+    （指数目标用于推导 market=cn 与能力矩阵）。
+    ``refresh_watchlist=False`` 仅用于已原子认领的定时快照，避免认领后再次热更新。
     """
     # Portfolio resolution is its own CLI contract boundary. A broker import
     # failure must reach the one-shot caller, while all later work keeps the
@@ -762,9 +848,10 @@ def run_full_analysis(
         _refresh_stock_index_cache_for_analysis(config)
         if portfolio_stock_codes is not None:
             stock_codes = portfolio_stock_codes
+            analysis_targets = None
 
         # Issue #529: Hot-reload STOCK_LIST from .env on each scheduled run
-        if stock_codes is None and portfolio_stock_codes is None:
+        if stock_codes is None and portfolio_stock_codes is None and refresh_watchlist:
             config.refresh_stock_list()
 
         using_config_stock_list = stock_codes is None and portfolio_stock_codes is None
@@ -802,6 +889,18 @@ def run_full_analysis(
         if set(filtered_codes) != set(effective_codes):
             skipped = set(effective_codes) - set(filtered_codes)
             logger.info("今日休市股票已跳过: %s", skipped)
+        if analysis_targets is not None:
+            if len(analysis_targets) != len(effective_codes):
+                raise ValueError("analysis_targets must align with stock_codes")
+            remaining_pairs = list(zip(effective_codes, analysis_targets))
+            filtered_targets = []
+            for filtered_code in filtered_codes:
+                for index, (code, target) in enumerate(remaining_pairs):
+                    if code == filtered_code:
+                        filtered_targets.append(target)
+                        remaining_pairs.pop(index)
+                        break
+            analysis_targets = filtered_targets
         stock_codes = filtered_codes
         skip_futu_stock_analysis = (
             portfolio_stock_codes is not None and not stock_codes
@@ -909,6 +1008,7 @@ def run_full_analysis(
                 send_notification=not args.no_notify,
                 merge_notification=merge_notification,
                 current_time=analysis_reference_time,
+                analysis_targets=analysis_targets,
             )
 
         if should_use_daily_market_context and not market_context_summary:
@@ -1145,13 +1245,25 @@ def run_scheduled_analysis(
     stock_codes: Optional[List[str]] = None,
 ) -> bool:
     """Run scheduled analysis with failures propagated to the scheduler."""
-    return run_full_analysis(config, args, stock_codes, raise_errors=True)
+    scheduled_for = getattr(args, "_scheduled_for", None)
+    if scheduled_for is None:
+        return run_full_analysis(config, args, stock_codes, raise_errors=True)
+
+    from src.services.scheduled_analysis_claim import run_claimed_scheduled_analysis
+
+    return run_claimed_scheduled_analysis(
+        config, args, scheduled_for,
+        lambda snapshot: run_full_analysis(
+            snapshot, args, stock_codes, raise_errors=True, refresh_watchlist=False,
+        ),
+    )
 
 
 def _run_analysis_with_runtime_scheduler_lock(
     config: Config,
     args: argparse.Namespace,
     stock_codes: Optional[List[str]] = None,
+    analysis_targets: Optional[List[AnalysisTarget]] = None,
 ) -> bool:
     from src.services.runtime_scheduler import run_with_global_analysis_lock
 
@@ -1162,7 +1274,15 @@ def _run_analysis_with_runtime_scheduler_lock(
         locked_args: argparse.Namespace,
         locked_stock_codes: Optional[List[str]] = None,
     ) -> bool:
-        result = run_full_analysis(locked_config, locked_args, locked_stock_codes)
+        if analysis_targets is None:
+            result = run_full_analysis(locked_config, locked_args, locked_stock_codes)
+        else:
+            result = run_full_analysis(
+                locked_config,
+                locked_args,
+                locked_stock_codes,
+                analysis_targets=analysis_targets,
+            )
         task_result["ok"] = bool(result)
         return task_result["ok"]
 
@@ -1322,6 +1442,32 @@ def _resolve_scheduled_stock_codes(stock_codes: Optional[List[str]]) -> Optional
     return None
 
 
+def _skips_stock_entry(args: argparse.Namespace, config: Config) -> bool:
+    """Whether the active mode consumes a stock list at all.
+
+    Modes that do not analyze the watchlist must not parse/classify
+    ``--stocks``/``STOCK_LIST`` tokens nor refresh the stock-index registry
+    before the mode dispatch, otherwise an unsupported index token would
+    wrongly block a run that never consumes it. Covered modes:
+    ``--backtest``, ``--market-review``, ``--etf-rotation``, ``--serve-only``/``--webui-only``,
+    ``--portfolio`` (any value) and ``--schedule``/``config.schedule_enabled``.
+    ``--serve`` (not serve-only) and plain one-shot runs still consume the
+    stock list and stay outside the guard. The webui-only flag is read
+    directly here because the webui -> serve mapping happens only later in
+    ``main()``.
+    """
+    return bool(
+        getattr(args, "backtest", False)
+        or getattr(args, "etf_rotation", False)
+        or getattr(args, "market_review", False)
+        or getattr(args, "serve_only", False)
+        or getattr(args, "webui_only", False)
+        or bool(getattr(args, "portfolio", None))
+        or getattr(args, "schedule", False)
+        or getattr(config, "schedule_enabled", False)
+    )
+
+
 def _reload_runtime_config() -> Config:
     """Reload config from the latest persisted `.env` values for scheduled runs."""
     _reload_env_file_values_preserving_overrides()
@@ -1456,16 +1602,52 @@ def main() -> int:
         return 0 if result.ok else 1
 
     # 解析股票列表（统一为大写 Issue #355）
+    # Story 1.5: 一次性 --stocks 入口使用 parse_analysis_target 构造结构化
+    # AnalysisTarget 列表，指数目标（sh/sz/csi 前缀与 .CSI alias）在入口即保留
+    # 身份语义；unsupported 目标（如未登记 .CSI）在入口明确拒绝，不进入 provider。
+    # 不消费个股列表的模式（回测/大盘复盘/仅服务/portfolio/定时）整体跳过
+    # 分类与索引刷新（_skips_stock_entry），避免无关坏 token 拦截模式主体。
+    _skip_stock_entry = _skips_stock_entry(args, config)
+    if args.stocks and getattr(args, "portfolio", None):
+        logger.info("同时指定了 --portfolio；实际分析时 portfolio 将覆盖 --stocks")
     stock_codes = None
-    if args.stocks:
-        stock_codes = [
-            resolve_index_stock_code_for_analysis(c)
-            for c in split_stock_list(args.stocks)
-            if (c or "").strip()
-        ]
+    analysis_targets = None
+    if args.stocks and not _skip_stock_entry:
+        # 在解析 --stocks 前先 best-effort 刷新股票索引注册表，保证首次运行能吃到
+        # 刷新后的 alias/身份；失败/超时/禁用不阻断分析。仅 --stocks 入口需要，
+        # 其他模式由 run_full_analysis 内的既有刷新覆盖。
+        _refresh_stock_index_cache_for_analysis(config)
+        tokens = [c for c in split_stock_list(args.stocks) if (c or "").strip()]
+        resolved = _classify_stock_list_tokens(tokens, entry_label="--stocks")
+        if resolved is None:
+            return 1
+        stock_codes, analysis_targets = resolved
         logger.info(f"使用命令行指定的股票列表: {stock_codes}")
-        if getattr(args, "portfolio", None):
-            logger.info("同时指定了 --portfolio；实际分析时 portfolio 将覆盖 --stocks")
+    elif (
+        os.getenv("GITHUB_ACTIONS") == "true"
+        and not _skip_stock_entry
+    ):
+        # 每日工作流（GITHUB_ACTIONS=true）无参数运行 `python main.py`（full 或
+        # stocks-only 模式）：把 STOCK_LIST token 分类为与一次性 --stocks 等价的
+        # 结构化 target，显式指数 token 进入指数路径、个股 token 保持既有路径。
+        # 不消费个股列表的模式由 _skips_stock_entry 整体跳过（不刷新不分类），
+        # 本地默认路径不在本入口构造 target。
+        raw_value = config.stock_list or []
+        raw_tokens = (
+            split_stock_list(raw_value)
+            if isinstance(raw_value, str)
+            else [str(c).strip() for c in raw_value if str(c or "").strip()]
+        )
+        raw_tokens = [c for c in raw_tokens if (c or "").strip()]
+        if raw_tokens:
+            _refresh_stock_index_cache_for_analysis(config)
+            resolved = _classify_stock_list_tokens(
+                raw_tokens, entry_label="GitHub Actions STOCK_LIST"
+            )
+            if resolved is None:
+                return 1
+            stock_codes, analysis_targets = resolved
+            logger.info(f"GitHub Actions 默认 STOCK_LIST: {stock_codes}")
 
     # === 处理 --webui / --webui-only 参数，映射到 --serve / --serve-only ===
     if args.webui:
@@ -1575,6 +1757,18 @@ def main() -> int:
             )
             return 0
 
+        # 模式0.5: ETF 轮动（规则化，不调用 LLM）
+        if getattr(args, 'etf_rotation', False):
+            logger.info("模式: ETF 轮动")
+            from src.services.etf_rotation_service import run_etf_rotation
+
+            report = run_etf_rotation(config, send_notification=not args.no_notify)
+            logger.info(
+                "ETF 轮动完成: as_of=%s target=%s failed=%s",
+                f"{report.as_of:%Y-%m-%d}", report.target_weights, list(report.failed_codes),
+            )
+            return 0
+
         # 模式1: 仅大盘复盘
         if args.market_review:
             from src.core.market_review import run_market_review
@@ -1613,6 +1807,9 @@ def main() -> int:
         # 模式2: 定时任务模式
         if args.schedule or config.schedule_enabled:
             if start_serve:
+                # 模式2 + Web 服务：此路径来自 --schedule/--webui/--serve 与
+                # config.schedule_enabled 的组合（均已入 guard），由 API runtime
+                # scheduler 接管；--serve-only 已在上面 serve_only 分支返回。
                 logger.info("模式: Web/API runtime scheduler")
                 logger.info(f"Web 服务运行中: http://{args.host}:{args.port}")
                 logger.info("Web/API runtime scheduler 已接管定时任务，保存设置会作用于当前进程")
@@ -1637,13 +1834,25 @@ def main() -> int:
             logger.info(f"启动时立即执行: {should_run_immediately}")
 
             from src.scheduler import run_with_schedule
-            scheduled_stock_codes = _resolve_scheduled_stock_codes(stock_codes)
+            scheduled_stock_codes = _resolve_scheduled_stock_codes(args.stocks or None)
             schedule_time_provider = _build_schedule_time_provider(config.schedule_time)
             schedule_times_provider = _build_schedule_times_provider(config.schedule_time)
 
-            def scheduled_task():
+            def scheduled_task(scheduled_for=None):
                 runtime_config = _reload_runtime_config()
-                result = run_full_analysis(runtime_config, args, scheduled_stock_codes)
+                if scheduled_for is None:
+                    result = run_full_analysis(runtime_config, args, scheduled_stock_codes)
+                else:
+                    from src.services.scheduled_analysis_claim import ScheduledAnalysisSkipped
+
+                    scheduled_args = argparse.Namespace(**vars(args))
+                    scheduled_args._scheduled_for = scheduled_for
+                    try:
+                        result = run_scheduled_analysis(runtime_config, scheduled_args, scheduled_stock_codes)
+                    except ScheduledAnalysisSkipped:
+                        logger.info("Scheduled analysis already claimed; skipping occurrence %s", scheduled_for)
+                        return
+
                 if result is False:
                     reason = _LAST_ANALYSIS_FAILURE_REASON or "unknown"
                     raise RuntimeError(
@@ -1676,6 +1885,7 @@ def main() -> int:
                 "run_immediately": should_run_immediately,
                 "background_tasks": background_tasks,
                 "schedule_time_provider": schedule_time_provider,
+                "pass_scheduled_for": True,
             }
             if hasattr(config, "schedule_times"):
                 schedule_kwargs["schedule_times"] = config.schedule_times
@@ -1686,7 +1896,9 @@ def main() -> int:
         # 模式3: 正常单次运行
         if config.run_immediately:
             try:
-                analysis_ok = _run_analysis_with_runtime_scheduler_lock(config, args, stock_codes)
+                analysis_ok = _run_analysis_with_runtime_scheduler_lock(
+                    config, args, stock_codes, analysis_targets
+                )
             except FutuPortfolioError as exc:
                 if not start_serve:
                     raise

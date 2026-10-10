@@ -1,7 +1,9 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CheckCircle2, ChevronDown, CircleAlert, CircleDashed, Clock, Play, Plus, RefreshCw, Trash2 } from 'lucide-react';
-import { useAuth, useSystemConfig } from '../hooks';
+import { useBlocker, useLocation } from 'react-router-dom';
+import type { Location } from 'react-router-dom';
+import { useAuth, useDesktopUpdate, useSystemConfig } from '../hooks';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import { createParsedApiError, getParsedApiError, type ParsedApiError } from '../api/error';
 import { analysisApi } from '../api/analysis';
@@ -36,57 +38,6 @@ import type {
   SystemConfigUpdateItem,
 } from '../types/systemConfig';
 import type { UiLanguage, UiTextKey } from '../i18n/uiText';
-
-type DesktopWindow = Window & {
-  dsaDesktop?: {
-    version?: unknown;
-    getUpdateState?: () => Promise<RawDesktopUpdateState>;
-    checkForUpdates?: () => Promise<RawDesktopUpdateState>;
-    installDownloadedUpdate?: () => Promise<boolean>;
-    openReleasePage?: (releaseUrl?: string) => Promise<boolean>;
-    onUpdateStateChange?: (listener: (state: RawDesktopUpdateState) => void) => (() => void) | void;
-  };
-};
-
-type DesktopUpdateState = {
-  status?: string;
-  updateMode?: string;
-  currentVersion?: string;
-  latestVersion?: string;
-  releaseUrl?: string;
-  checkedAt?: string;
-  publishedAt?: string;
-  message?: string;
-  releaseName?: string;
-  tagName?: string;
-  downloadPercent?: number | null;
-  downloadedBytes?: number | null;
-  totalBytes?: number | null;
-};
-
-type RawDesktopUpdateState = {
-  status?: unknown;
-  updateMode?: unknown;
-  currentVersion?: unknown;
-  latestVersion?: unknown;
-  releaseUrl?: unknown;
-  checkedAt?: unknown;
-  publishedAt?: unknown;
-  message?: unknown;
-  releaseName?: unknown;
-  tagName?: unknown;
-  downloadPercent?: unknown;
-  downloadedBytes?: unknown;
-  totalBytes?: unknown;
-};
-
-type DesktopUpdateNotice = {
-  title: string;
-  message: string;
-  variant: 'error' | 'success' | 'warning';
-  actionLabel?: string;
-  actionKind?: 'release' | 'install';
-};
 
 const LLM_CHANNEL_EDITOR_RUNTIME_KEYS = new Set([
   'LITELLM_MODEL',
@@ -512,132 +463,6 @@ function isPromptCacheAdvancedSetting(item: { key: string }) {
   return PROMPT_CACHE_ADVANCED_SETTING_KEYS.has(item.key);
 }
 
-function trimDesktopRuntimeString(value: unknown) {
-  return typeof value === 'string' ? value.trim() : '';
-}
-
-function normalizeDesktopRuntimeNumber(value: unknown) {
-  if (value === null || value === undefined || value === '') {
-    return null;
-  }
-  const numberValue = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(numberValue) ? numberValue : null;
-}
-
-function getDesktopRuntimeApi() {
-  if (typeof window === 'undefined') {
-    return undefined;
-  }
-
-  return (window as DesktopWindow).dsaDesktop;
-}
-
-function getDesktopAppVersion() {
-  return trimDesktopRuntimeString(getDesktopRuntimeApi()?.version);
-}
-
-function normalizeDesktopUpdateState(state: RawDesktopUpdateState | null | undefined) {
-  if (!state || typeof state !== 'object') {
-    return null;
-  }
-
-  return {
-    status: trimDesktopRuntimeString(state.status) || 'idle',
-    updateMode: trimDesktopRuntimeString(state.updateMode) || 'manual',
-    currentVersion: trimDesktopRuntimeString(state.currentVersion),
-    latestVersion: trimDesktopRuntimeString(state.latestVersion),
-    releaseUrl: trimDesktopRuntimeString(state.releaseUrl),
-    checkedAt: trimDesktopRuntimeString(state.checkedAt),
-    publishedAt: trimDesktopRuntimeString(state.publishedAt),
-    message: trimDesktopRuntimeString(state.message),
-    releaseName: trimDesktopRuntimeString(state.releaseName),
-    tagName: trimDesktopRuntimeString(state.tagName),
-    downloadPercent: normalizeDesktopRuntimeNumber(state.downloadPercent),
-    downloadedBytes: normalizeDesktopRuntimeNumber(state.downloadedBytes),
-    totalBytes: normalizeDesktopRuntimeNumber(state.totalBytes),
-  };
-}
-
-function getDesktopUpdateNotice(
-  state: DesktopUpdateState | null,
-  t: (key: UiTextKey, params?: Record<string, string | number>) => string,
-): DesktopUpdateNotice | null {
-  if (!state) {
-    return null;
-  }
-
-  if (state.status === 'update-available') {
-    const latestLabel = state.latestVersion || state.tagName || t('settings.desktopLatest');
-    const currentLabel = state.currentVersion || getDesktopAppVersion() || WEB_BUILD_INFO.version;
-    return {
-      title: t('settings.desktopUpdateAvailable'),
-      message: t('settings.desktopUpdateMessage', {
-        current: currentLabel,
-        latest: latestLabel,
-        message: state.message || t('settings.desktopUpdateReleaseMessage'),
-      }),
-      variant: 'warning' as const,
-      actionLabel: state.updateMode === 'auto' ? undefined : t('settings.desktopDownload'),
-      actionKind: state.updateMode === 'auto' ? undefined : 'release',
-    };
-  }
-
-  if (state.status === 'downloading') {
-    const percentText = typeof state.downloadPercent === 'number' ? `（${state.downloadPercent}%）` : '';
-    return {
-      title: t('settings.desktopDownloading'),
-      message: state.message || t('settings.desktopUpdateDownloadingMessage', { percent: percentText }),
-      variant: 'warning' as const,
-    };
-  }
-
-  if (state.status === 'update-downloaded') {
-    return {
-      title: t('settings.desktopDownloaded'),
-      message: state.message || t('settings.desktopUpdateDownloadedMessage'),
-      variant: 'success' as const,
-      actionLabel: t('settings.desktopInstall'),
-      actionKind: 'install',
-    };
-  }
-
-  if (state.status === 'installing') {
-    return {
-      title: t('settings.desktopInstalling'),
-      message: state.message || t('settings.desktopUpdateInstallingMessage'),
-      variant: 'warning' as const,
-    };
-  }
-
-  if (state.status === 'up-to-date') {
-    return {
-      title: t('settings.desktopUpToDate'),
-      message: state.message || t('settings.desktopUpToDateMessage'),
-      variant: 'success' as const,
-    };
-  }
-
-  if (state.status === 'checking') {
-    return {
-      title: t('settings.desktopChecking'),
-      message: state.message || t('settings.desktopUpdateCheckingMessage'),
-      variant: 'warning' as const,
-    };
-  }
-
-  if (state.status === 'error') {
-    return {
-      title: t('settings.desktopCheckError'),
-      message: state.message || t('settings.desktopUpdateErrorMessage'),
-      variant: 'error' as const,
-      actionLabel: state.updateMode === 'auto' && state.releaseUrl ? t('settings.desktopDownload') : undefined,
-      actionKind: state.updateMode === 'auto' && state.releaseUrl ? 'release' : undefined,
-    };
-  }
-
-  return null;
-}
-
 function formatEnvBackupFilename(isDesktopRuntime: boolean) {
   const now = new Date();
   const pad = (value: number) => value.toString().padStart(2, '0');
@@ -904,6 +729,7 @@ type SchedulerSettingsCardProps = {
   disabled: boolean;
   issueByKey: Record<string, ConfigValidationIssue[]>;
   statusRefreshToken: number;
+  draftResetToken: number;
   onChange: (key: string, value: string) => void;
   onSchedulerStateChange?: (payload: {
     runtimeEnabled: boolean | null;
@@ -918,6 +744,7 @@ const SchedulerSettingsCard: React.FC<SchedulerSettingsCardProps> = ({
   disabled,
   issueByKey,
   statusRefreshToken,
+  draftResetToken,
   onChange,
   onSchedulerStateChange,
   t,
@@ -933,7 +760,10 @@ const SchedulerSettingsCard: React.FC<SchedulerSettingsCardProps> = ({
   const [statusError, setStatusError] = useState<ParsedApiError | null>(null);
   const [runNowError, setRunNowError] = useState<ParsedApiError | null>(null);
   const [runNowSuccess, setRunNowSuccess] = useState('');
-  const [scheduleEnabledOverride, setScheduleEnabledOverride] = useState<boolean | null>(null);
+  const [scheduleEnabledDraft, setScheduleEnabledDraft] = useState<{ token: number; value: boolean } | null>(null);
+  const scheduleEnabledOverride = scheduleEnabledDraft?.token === draftResetToken
+    ? scheduleEnabledDraft.value
+    : null;
 
   const refreshSchedulerStatus = useCallback(async () => {
     setStatusError(null);
@@ -1026,7 +856,7 @@ const SchedulerSettingsCard: React.FC<SchedulerSettingsCardProps> = ({
                     disabled={disabled || !scheduleEnabledItem?.schema?.isEditable}
                     onChange={(event) => {
                       const nextEnabled = Boolean(event.target.checked);
-                      setScheduleEnabledOverride(nextEnabled);
+                      setScheduleEnabledDraft({ token: draftResetToken, value: nextEnabled });
                       onChange('SCHEDULE_ENABLED', nextEnabled ? 'true' : 'false');
                     }}
                   />
@@ -1180,6 +1010,7 @@ const SchedulerSettingsCard: React.FC<SchedulerSettingsCardProps> = ({
 
 const SettingsPage: React.FC = () => {
   const { authEnabled, passwordChangeable } = useAuth();
+  const location = useLocation();
   const { language: uiLanguage, t } = useUiLanguage();
   const [envBackupActionError, setEnvBackupActionError] = useState<ParsedApiError | null>(null);
   const [envBackupActionSuccess, setEnvBackupActionSuccess] = useState<string>('');
@@ -1189,8 +1020,6 @@ const SettingsPage: React.FC = () => {
   const [isImportingEnv, setIsImportingEnv] = useState(false);
   const [isUpdatingScreening, setIsUpdatingScreening] = useState(false);
   const [showImportConfirm, setShowImportConfirm] = useState(false);
-  const [desktopUpdateState, setDesktopUpdateState] = useState<DesktopUpdateState | null>(null);
-  const [isCheckingDesktopUpdate, setIsCheckingDesktopUpdate] = useState(false);
   const [schedulerStatusRefreshToken, setSchedulerStatusRefreshToken] = useState(0);
   const [schedulerRuntimeEnabled, setSchedulerRuntimeEnabled] = useState<boolean | null>(null);
   const [schedulerOverrideFromUi, setSchedulerOverrideFromUi] = useState<boolean | null>(null);
@@ -1200,15 +1029,23 @@ const SettingsPage: React.FC = () => {
   const [isRunningSetupSmoke, setIsRunningSetupSmoke] = useState(false);
   const [setupSmokeError, setSetupSmokeError] = useState<ParsedApiError | null>(null);
   const [setupSmokeSuccess, setSetupSmokeSuccess] = useState('');
+  const [localDraftResetToken, setLocalDraftResetToken] = useState(0);
+  const [llmChannelHasDirty, setLlmChannelHasDirty] = useState(false);
+  const [llmChannelIsSaving, setLlmChannelIsSaving] = useState(false);
   const [llmChannelDraftItems, setLlmChannelDraftItems] = useState<SystemConfigUpdateItem[]>([]);
   const envBackupImportRef = useRef<HTMLInputElement | null>(null);
   const setupStatusRequestIdRef = useRef(0);
-  const desktopRuntimeApi = getDesktopRuntimeApi();
-  const isDesktopRuntime = Boolean(desktopRuntimeApi);
-  const canCheckDesktopUpdate = Boolean(
-    desktopRuntimeApi?.getUpdateState && desktopRuntimeApi?.checkForUpdates && desktopRuntimeApi?.openReleasePage
-  );
-  const desktopAppVersion = getDesktopAppVersion();
+  const {
+    isDesktopRuntime,
+    canCheckDesktopUpdate,
+    desktopAppVersion,
+    isBusy: isDesktopUpdateBusy,
+    isChecking: isCheckingDesktopUpdate,
+    notice: desktopUpdateNotice,
+    checkForUpdates: handleDesktopUpdateCheck,
+    openReleasePage: openDesktopReleasePage,
+    installDownloadedUpdate: installDesktopUpdate,
+  } = useDesktopUpdate();
   const shouldShowDesktopVersionCard = Boolean(desktopAppVersion);
 
   // Set page title
@@ -1301,11 +1138,20 @@ const SettingsPage: React.FC = () => {
   }, [load]);
 
   useEffect(() => {
-    const requestedCategory = new URLSearchParams(window.location.search).get('category');
+    const requestedCategory = new URLSearchParams(location.search).get('category');
     if (requestedCategory && categories.some((category) => category.category === requestedCategory)) {
       setActiveCategory(requestedCategory);
     }
-  }, [categories, setActiveCategory]);
+  }, [categories, location.search, setActiveCategory]);
+
+  useEffect(() => {
+    if (isLoading || activeCategory !== 'system' || location.hash !== '#desktop-version-info') {
+      return;
+    }
+
+    const node = document.getElementById('desktop-version-info');
+    node?.scrollIntoView({ block: 'start' });
+  }, [activeCategory, isLoading, location.hash]);
 
   useEffect(() => {
     void refreshSetupStatus();
@@ -1325,57 +1171,12 @@ const SettingsPage: React.FC = () => {
     };
   }, [clearToast, toast]);
 
-  useEffect(() => {
-    if (!canCheckDesktopUpdate) {
-      setDesktopUpdateState(null);
-      setIsCheckingDesktopUpdate(false);
-      return;
-    }
-
-    let active = true;
-
-    const syncDesktopUpdateState = async () => {
-      try {
-        const state = await desktopRuntimeApi?.getUpdateState?.();
-        if (active) {
-          setDesktopUpdateState(normalizeDesktopUpdateState(state));
-        }
-      } catch (error: unknown) {
-        if (!active) {
-          return;
-        }
-        setDesktopUpdateState({
-          status: 'error',
-          message: error instanceof Error ? error.message : t('settings.desktopUpdateErrorMessage'),
-        });
-      }
-    };
-
-    void syncDesktopUpdateState();
-
-    const unsubscribe = desktopRuntimeApi?.onUpdateStateChange?.((state) => {
-      if (!active) {
-        return;
-      }
-      setDesktopUpdateState(normalizeDesktopUpdateState(state));
-      setIsCheckingDesktopUpdate(false);
-    });
-
-    return () => {
-      active = false;
-      if (typeof unsubscribe === 'function') {
-        unsubscribe();
-      }
-    };
-  }, [canCheckDesktopUpdate, desktopRuntimeApi, t]);
-
   const rawActiveItems = itemsByCategory[activeCategory] || [];
   const rawActiveItemMap = new Map(rawActiveItems.map((item) => [item.key, String(item.value ?? '')]));
   const firstSetupStockCode = parseSetupStockList(getConfigItem(itemsByCategory.base || [], 'STOCK_LIST')?.value)[0] || '';
   const screeningItem = (itemsByCategory.base || []).find((item) => item.key === 'SCREENING_ENABLED');
   const screeningEnabled = String(screeningItem?.value ?? '').trim().toLowerCase() === 'true';
   const shouldShowFirstRunSetup = activeCategory === 'base';
-  const shouldShowAlphaSiftSettings = activeCategory === 'data_source' && Boolean(alphasiftItem);
   const linkCrawlItems = (itemsByCategory.data_source || []).filter((item) => LINK_CRAWL_SETTING_KEYS.has(item.key));
   const shouldShowLinkCrawlSettings = activeCategory === 'data_source' && linkCrawlItems.length > 0;
   const shouldShowScreeningSettings = activeCategory === 'base' && Boolean(screeningItem);
@@ -1388,7 +1189,57 @@ const SettingsPage: React.FC = () => {
   const hasRuntimeSchedulerMismatchInDraft = hasRuntimeSchedulerMismatch
     && !currentChangedItems.some((item) => item.key === 'SCHEDULE_ENABLED');
   const effectiveHasDirty = hasDirty || hasRuntimeSchedulerMismatchInDraft;
+  const hasUnsavedEdits = effectiveHasDirty || llmChannelHasDirty;
+  const hasPendingSave = isSaving || llmChannelIsSaving || isImportingEnv;
+  const shouldGuardDeparture = hasUnsavedEdits || hasPendingSave;
+  const clearAllDrafts = () => {
+    resetDraft();
+    setSchedulerOverrideFromUi(null);
+    setLlmChannelDraftItems([]);
+    setLlmChannelHasDirty(false);
+    setLocalDraftResetToken((current) => current + 1);
+  };
+  const resetAllDrafts = () => {
+    if (!hasPendingSave) {
+      clearAllDrafts();
+    }
+  };
   const effectiveDirtyCount = dirtyCount + (hasRuntimeSchedulerMismatchInDraft ? 1 : 0);
+
+  // Guard every draft owner, including editor-local changes that are not yet
+  // serializable as valid configuration update items.
+  useEffect(() => {
+    if (!shouldGuardDeparture) {
+      return;
+    }
+    const handler = (event: BeforeUnloadEvent) => {
+      // preventDefault is the modern cancellation signal; returnValue keeps
+      // compatibility with browsers using the legacy beforeunload contract.
+      event.preventDefault();
+      event.returnValue = t('settings.unsavedChangesMessage');
+      return event.returnValue;
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => {
+      window.removeEventListener('beforeunload', handler);
+    };
+  }, [shouldGuardDeparture, t]);
+
+  // Category changes stay within /settings; leaving through browser history
+  // or an in-app link must use the same complete dirty-state predicate.
+  const settingsBlocker = useBlocker(
+    useCallback(
+      ({ currentLocation, nextLocation }: { currentLocation: Location; nextLocation: Location }) =>
+        shouldGuardDeparture && nextLocation.pathname !== '/settings'
+        // Only block when actually leaving /settings. Reload-stay on
+        // /settings?foo=bar (search-only change on the same pathname) would
+        // otherwise prompt unnecessarily.
+        ? nextLocation.pathname !== currentLocation.pathname
+        : false,
+      [shouldGuardDeparture],
+    ),
+  );
+
 
   const handleSchedulerRuntimeStateChange = useCallback(({ runtimeEnabled, overrideEnabled }: {
     runtimeEnabled: boolean | null;
@@ -1434,7 +1285,6 @@ const SettingsPage: React.FC = () => {
     ...SCHEDULER_SETTING_KEYS,
   ]);
   const DATA_SOURCE_HIDDEN_KEYS = new Set([
-    'ALPHASIFT_ENABLED',
     ...LINK_CRAWL_SETTING_KEYS,
   ]);
   const BASE_HIDDEN_KEYS = new Set([
@@ -1456,6 +1306,8 @@ const SettingsPage: React.FC = () => {
       })
       : activeCategory === 'system'
         ? rawActiveItems.filter((item) => !SYSTEM_HIDDEN_KEYS.has(item.key))
+      : activeCategory === 'data_source'
+        ? rawActiveItems.filter((item) => !DATA_SOURCE_HIDDEN_KEYS.has(item.key))
       : activeCategory === 'agent'
         ? rawActiveItems.filter((item) => !AGENT_HIDDEN_KEYS.has(item.key))
       : rawActiveItems;
@@ -1494,9 +1346,12 @@ const SettingsPage: React.FC = () => {
   };
 
   const beginEnvBackupImport = () => {
+    if (hasPendingSave) {
+      return;
+    }
     setEnvBackupActionError(null);
     setEnvBackupActionSuccess('');
-    if (hasDirty) {
+    if (hasUnsavedEdits) {
       setShowImportConfirm(true);
       return;
     }
@@ -1507,7 +1362,7 @@ const SettingsPage: React.FC = () => {
     const file = event.target.files?.[0];
     event.target.value = '';
     setShowImportConfirm(false);
-    if (!file) {
+    if (!file || hasPendingSave) {
       return;
     }
 
@@ -1521,6 +1376,9 @@ const SettingsPage: React.FC = () => {
         content,
         reloadNow: true,
       });
+      // The server accepted the replacement. Discard every local draft even
+      // if the following refresh fails or the model fingerprint is unchanged.
+      clearAllDrafts();
       const reloaded = await load();
       if (!reloaded) {
         setEnvBackupActionError(createParsedApiError({
@@ -1541,31 +1399,6 @@ const SettingsPage: React.FC = () => {
       setEnvBackupActionError(getParsedApiError(error));
     } finally {
       setIsImportingEnv(false);
-    }
-  };
-
-  const handleDesktopUpdateCheck = async () => {
-    if (!desktopRuntimeApi?.checkForUpdates) {
-      return;
-    }
-
-    setIsCheckingDesktopUpdate(true);
-    setDesktopUpdateState((current) => ({
-      ...(current || {}),
-      status: 'checking',
-      message: t('settings.desktopUpdateCheckingMessage'),
-    }));
-
-    try {
-      const state = await desktopRuntimeApi.checkForUpdates();
-      setDesktopUpdateState(normalizeDesktopUpdateState(state));
-    } catch (error: unknown) {
-      setDesktopUpdateState({
-        status: 'error',
-        message: error instanceof Error ? error.message : t('settings.desktopUpdateErrorMessage'),
-      });
-    } finally {
-      setIsCheckingDesktopUpdate(false);
     }
   };
 
@@ -1599,6 +1432,9 @@ const SettingsPage: React.FC = () => {
   };
 
   const handleSaveConfig = async () => {
+    if (isImportingEnv) {
+      return;
+    }
     const changedItems = getChangedItems();
     const syncRuntimeSchedulerState =
       schedulerOverrideFromUi !== null
@@ -1640,40 +1476,6 @@ const SettingsPage: React.FC = () => {
     } catch (error: unknown) {
       setScreeningActionError(getParsedApiError(error));
       await refreshAfterExternalSave(['SCREENING_ENABLED']);
-    }
-  };
-
-  const openDesktopReleasePage = async () => {
-    if (!desktopRuntimeApi?.openReleasePage) {
-      return;
-    }
-
-    await desktopRuntimeApi.openReleasePage(desktopUpdateState?.releaseUrl);
-  };
-
-  const installDesktopUpdate = async () => {
-    if (!desktopRuntimeApi?.installDownloadedUpdate) {
-      setDesktopUpdateState((current) => ({
-        ...(current || {}),
-        status: 'error',
-        message: t('settings.desktopManualUnsupported'),
-      }));
-      return;
-    }
-
-    try {
-      setDesktopUpdateState((current) => ({
-        ...(current || {}),
-        status: 'installing',
-        message: t('settings.desktopUpdateInstallingMessage'),
-      }));
-      await desktopRuntimeApi.installDownloadedUpdate();
-    } catch (error: unknown) {
-      setDesktopUpdateState((current) => ({
-        ...(current || {}),
-        status: 'error',
-        message: error instanceof Error ? error.message : t('settings.desktopManualUnsupported'),
-      }));
     }
   };
 
@@ -1725,7 +1527,6 @@ const SettingsPage: React.FC = () => {
     }
   };
 
-  const desktopUpdateNotice = getDesktopUpdateNotice(desktopUpdateState, t);
   const shouldGuardActiveConfigPanel = activeCategory === 'notification' || activeCategory === 'agent';
   const activeConfigPanelErrorTitle = activeCategory === 'agent' ? t('settings.agentSettings') : t('settings.notificationSettings');
   const settingsPanelDiagnosticHint = isDesktopRuntime
@@ -1762,7 +1563,7 @@ const SettingsPage: React.FC = () => {
                 key={item.key}
                 item={item}
                 value={item.value}
-                disabled={isSaving}
+                disabled={isSaving || isImportingEnv}
                 onChange={setDraftValue}
                 issues={fieldIssues}
               />
@@ -1789,7 +1590,7 @@ const SettingsPage: React.FC = () => {
                 key={item.key}
                 item={item}
                 value={item.value}
-                disabled={isSaving}
+                disabled={isSaving || isImportingEnv}
                 onChange={setDraftValue}
                 issues={issueByKey[item.key] || []}
               />
@@ -1823,8 +1624,8 @@ const SettingsPage: React.FC = () => {
               variant="settings-secondary"
               size="sm"
               className="px-2.5"
-              onClick={resetDraft}
-              disabled={isLoading || isSaving}
+              onClick={resetAllDrafts}
+              disabled={isLoading || hasPendingSave}
             >
               <RefreshCw className="h-4 w-4" aria-hidden="true" />
               {t('settings.reset')}
@@ -1835,7 +1636,7 @@ const SettingsPage: React.FC = () => {
               size="sm"
               className="px-2.5"
               onClick={() => void handleSaveConfig()}
-              disabled={!effectiveHasDirty || isSaving || isLoading}
+              disabled={!effectiveHasDirty || isSaving || isLoading || isImportingEnv}
               isLoading={isSaving}
               loadingText={t('settings.saving')}
             >
@@ -1921,7 +1722,7 @@ const SettingsPage: React.FC = () => {
                       type="button"
                       variant={screeningEnabled ? 'settings-secondary' : 'settings-primary'}
                       onClick={() => void updateScreeningEnabled(!screeningEnabled)}
-                      disabled={isSaving || isLoading || isUpdatingScreening}
+                      disabled={isSaving || isLoading || isImportingEnv || isUpdatingScreening}
                       isLoading={isUpdatingScreening}
                       loadingText={screeningEnabled ? t('settings.disablingScreening') : t('settings.enablingScreening')}
                     >
@@ -1950,10 +1751,12 @@ const SettingsPage: React.FC = () => {
               />
             ) : null}
             {activeCategory === 'system' ? <AuthSettingsCard /> : null}
-            {activeCategory === 'system' ? (
+            {activeCategory === 'system' || schedulerOverrideFromUi !== null ? (
+              <div hidden={activeCategory !== 'system'}>
               <SchedulerSettingsCard
-                items={rawActiveItems}
-                disabled={isSaving || isLoading}
+                draftResetToken={localDraftResetToken}
+                items={itemsByCategory.system || []}
+                disabled={isSaving || isLoading || isImportingEnv}
                 issueByKey={issueByKey}
                 statusRefreshToken={schedulerStatusRefreshToken}
                 onSchedulerStateChange={handleSchedulerRuntimeStateChange}
@@ -1961,8 +1764,10 @@ const SettingsPage: React.FC = () => {
                 t={t}
                 language={uiLanguage}
               />
+              </div>
             ) : null}
             {activeCategory === 'system' ? (
+              <div id="desktop-version-info">
               <SettingsSectionCard
                 title={t('settings.versionInfo')}
                 description={t('settings.versionInfoDescription')}
@@ -2021,7 +1826,7 @@ const SettingsPage: React.FC = () => {
                         type="button"
                         variant="settings-secondary"
                         onClick={() => void handleDesktopUpdateCheck()}
-                        disabled={isCheckingDesktopUpdate}
+                        disabled={isDesktopUpdateBusy}
                         isLoading={isCheckingDesktopUpdate}
                         loadingText={t('settings.checkingDesktopUpdate')}
                       >
@@ -2055,6 +1860,7 @@ const SettingsPage: React.FC = () => {
                   </p>
                 ) : null}
               </SettingsSectionCard>
+              </div>
             ) : null}
             {activeCategory === 'system' ? (
               <SettingsSectionCard
@@ -2082,7 +1888,7 @@ const SettingsPage: React.FC = () => {
                       type="button"
                       variant="settings-primary"
                       onClick={beginEnvBackupImport}
-                      disabled={envBackupActionDisabled}
+                      disabled={envBackupActionDisabled || hasPendingSave}
                       isLoading={isImportingEnv}
                       loadingText={t('settings.importingEnv')}
                     >
@@ -2132,11 +1938,12 @@ const SettingsPage: React.FC = () => {
                     await refreshAfterExternalSave(['STOCK_LIST']);
                     void refreshSetupStatus();
                   }}
-                  disabled={isSaving || isLoading}
+                  disabled={isSaving || isLoading || isImportingEnv}
                 />
               </SettingsSectionCard>
             ) : null}
-            {activeCategory === 'ai_model' ? (
+            {activeCategory === 'ai_model' || llmChannelHasDirty || llmChannelIsSaving ? (
+              <div hidden={activeCategory !== 'ai_model'}>
               <SettingsSectionCard
                 title={t('settings.llmAccess')}
                 description={t('settings.llmAccessDescription')}
@@ -2144,10 +1951,13 @@ const SettingsPage: React.FC = () => {
                 <GenerationBackendStatusPanel
                   items={generationBackendDraftItems}
                   maskToken={maskToken}
-                  disabled={isSaving || isLoading}
+                  disabled={isSaving || isLoading || isImportingEnv}
                 />
                 <LLMChannelEditor
-                  items={rawActiveItems}
+                  draftResetToken={localDraftResetToken}
+                  onDirtyChange={setLlmChannelHasDirty}
+                  onSavingChange={setLlmChannelIsSaving}
+                  items={itemsByCategory.ai_model || []}
                   configVersion={configVersion}
                   maskToken={maskToken}
                   modelProviderPrefixes={llmModelProviders}
@@ -2157,9 +1967,10 @@ const SettingsPage: React.FC = () => {
                     await refreshAfterExternalSave(updatedItems.map((item) => item.key));
                     void refreshSetupStatus();
                   }}
-                  disabled={isSaving || isLoading}
+                  disabled={isSaving || isLoading || isImportingEnv}
                 />
               </SettingsSectionCard>
+              </div>
             ) : null}
             {activeCategory === 'system' && passwordChangeable ? (
               <ChangePasswordCard />
@@ -2173,7 +1984,7 @@ const SettingsPage: React.FC = () => {
                 <NotificationTestPanel
                   items={rawActiveItems.map((item) => ({ key: item.key, value: String(item.value ?? '') }))}
                   maskToken={maskToken}
-                  disabled={isSaving || isLoading}
+                  disabled={isSaving || isLoading || isImportingEnv}
                 />
               </SettingsPanelErrorBoundary>
             ) : null}
@@ -2192,7 +2003,7 @@ const SettingsPage: React.FC = () => {
                     maskToken={maskToken}
                     selectedBackend={selectedAgentBackend}
                     agentArch={selectedAgentArch}
-                    disabled={isSaving || isLoading}
+                    disabled={isSaving || isLoading || isImportingEnv}
                     onUseSingleAgent={() => setDraftValue('AGENT_ARCH', 'single')}
                     onEnableAgentMode={() => setDraftValue('AGENT_MODE', 'true')}
                   />
@@ -2232,12 +2043,34 @@ const SettingsPage: React.FC = () => {
         message={t('settings.importConfirmMessage')}
         confirmText={t('settings.importConfirmContinue')}
         cancelText={t('common.cancel')}
+        confirmDisabled={hasPendingSave}
         onConfirm={() => {
+          if (hasPendingSave) {
+            return;
+          }
           setShowImportConfirm(false);
           envBackupImportRef.current?.click();
         }}
         onCancel={() => {
           setShowImportConfirm(false);
+        }}
+      />
+      <ConfirmDialog
+        isOpen={settingsBlocker.state === 'blocked'}
+        title={t(hasPendingSave ? 'settings.saving' : hasUnsavedEdits ? 'settings.unsavedChangesTitle' : 'settings.actionSuccess')}
+        message={t(hasPendingSave ? 'settings.pendingSaveLeaveMessage' : hasUnsavedEdits ? 'settings.unsavedChangesMessage' : 'settings.savedChangesLeaveMessage')}
+        confirmText={t(hasPendingSave ? 'settings.saving' : hasUnsavedEdits ? 'settings.unsavedChangesDiscard' : 'common.confirm')}
+        cancelText={t('common.cancel')}
+        confirmDisabled={hasPendingSave}
+        onConfirm={() => {
+          if (hasPendingSave) {
+            return;
+          }
+          resetAllDrafts();
+          settingsBlocker.proceed?.();
+        }}
+        onCancel={() => {
+          settingsBlocker.reset?.();
         }}
       />
     </div>

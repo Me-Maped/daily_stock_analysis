@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 SINA_REALTIME_ENDPOINT = "hq.sinajs.cn/list"
 TENCENT_REALTIME_ENDPOINT = "qt.gtimg.cn/q"
 _AKSHARE_HISTORY_CALL_TIMEOUT = 30.0
+_AKSHARE_MARKET_STATS_CALL_TIMEOUT = 30.0
 _AKSHARE_TIMEOUT_PROCESS_JOIN_GRACE = 1.0
 _AKSHARE_TIMEOUT_PROCESS_START_METHOD = "spawn"
 
@@ -249,8 +250,20 @@ def _is_us_code(stock_code: str) -> bool:
 
 
 def _to_sina_tx_symbol(stock_code: str) -> str:
-    """Convert 6-digit A-share code to sh/sz/bj prefixed symbol for Sina/Tencent APIs."""
-    base = (stock_code.strip().split(".")[0] if "." in stock_code else stock_code).strip()
+    """Convert 6-digit A-share code to sh/sz/bj prefixed symbol for Sina/Tencent APIs.
+
+    Explicit sh/sz/bj prefixes are preserved (``sh000016`` -> ``sh000016``) so
+    registered index codes keep their index identity instead of degrading into
+    the colliding stock symbol (Story 1.5).
+    """
+    raw = (stock_code or "").strip()
+    lower = raw.lower()
+    for prefix in ("sh", "sz", "bj"):
+        if lower.startswith(prefix) and len(raw) > len(prefix):
+            candidate = raw[len(prefix):]
+            if candidate.isdigit() and len(candidate) == 6:
+                return f"{prefix}{candidate}"
+    base = (raw.split(".")[0] if "." in raw else raw).strip()
     if is_bse_code(base):
         return f"bj{base}"
     # Shanghai: 60xxxx, 5xxxx (ETF), 90xxxx (B-shares)
@@ -416,6 +429,7 @@ class AkshareFetcher(BaseFetcher):
         self.sleep_max = sleep_max
         self._last_request_time: Optional[float] = None
         self._history_call_timeout = _AKSHARE_HISTORY_CALL_TIMEOUT
+        self._market_stats_call_timeout = _AKSHARE_MARKET_STATS_CALL_TIMEOUT
         # 东财补丁开启才执行打补丁操作
         if get_config().enable_eastmoney_patch:
             eastmoney_patch()
@@ -2001,7 +2015,11 @@ class AkshareFetcher(BaseFetcher):
                 "[MarketStats] component=market_stats provider=AkshareFetcher "
                 "api=ak.stock_zh_a_spot_em action=request_start"
             )
-            df = ak.stock_zh_a_spot_em()
+            df = _akshare_call_with_timeout(
+                ak.stock_zh_a_spot_em,
+                timeout=self._market_stats_call_timeout,
+                call_name="ak.stock_zh_a_spot_em",
+            )
             elapsed = time.monotonic() - started_at
             logger.info(
                 "[MarketStats] component=market_stats provider=AkshareFetcher "
@@ -2013,6 +2031,15 @@ class AkshareFetcher(BaseFetcher):
             logger.warning(
                 "[MarketStats] component=market_stats provider=AkshareFetcher "
                 "api=ak.stock_zh_a_spot_em action=parse status=empty"
+            )
+        except TimeoutError as e:
+            elapsed = time.monotonic() - started_at
+            logger.warning(
+                "[MarketStats] component=market_stats provider=AkshareFetcher "
+                "api=ak.stock_zh_a_spot_em action=request_timeout elapsed=%.2fs "
+                "error=%s fallback=ak.stock_zh_a_spot",
+                elapsed,
+                e,
             )
         except Exception as e:
             logger.warning(
@@ -2031,7 +2058,11 @@ class AkshareFetcher(BaseFetcher):
                 "[MarketStats] component=market_stats provider=AkshareFetcher "
                 "api=ak.stock_zh_a_spot action=request_start"
             )
-            df = ak.stock_zh_a_spot()
+            df = _akshare_call_with_timeout(
+                ak.stock_zh_a_spot,
+                timeout=self._market_stats_call_timeout,
+                call_name="ak.stock_zh_a_spot",
+            )
             elapsed = time.monotonic() - started_at
             logger.info(
                 "[MarketStats] component=market_stats provider=AkshareFetcher "
@@ -2043,6 +2074,15 @@ class AkshareFetcher(BaseFetcher):
             logger.warning(
                 "[MarketStats] component=market_stats provider=AkshareFetcher "
                 "api=ak.stock_zh_a_spot action=parse status=empty"
+            )
+        except TimeoutError as e:
+            elapsed = time.monotonic() - started_at
+            logger.error(
+                "[MarketStats] component=market_stats provider=AkshareFetcher "
+                "api=ak.stock_zh_a_spot action=request_timeout elapsed=%.2fs "
+                "error=%s fallback=none",
+                elapsed,
+                e,
             )
         except Exception as e:
             logger.error(

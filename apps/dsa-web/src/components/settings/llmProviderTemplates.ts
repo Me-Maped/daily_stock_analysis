@@ -68,7 +68,7 @@ export const LLM_PROVIDER_TEMPLATES: LLMProviderTemplate[] = [
     configHint:
       '同一 ANSPIRE_API_KEYS 可复用到搜索与 LLM 渠道。以下模型与网关为配置示例，实际可用性请以账号权限和控制台为准；建议先点“测试连接”确认。',
     officialSources: [
-      { label: 'Anspire Open', url: 'https://open.anspire.cn/?share_code=QFBC0FYC' },
+      { label: 'Anspire Open', url: 'https://open.anspire.cn/dsa?share_code=QFBC0FYC' },
       {
         label: 'LiteLLM OpenAI-compatible',
         url: 'https://docs.litellm.ai/docs/providers/openai_compatible',
@@ -158,6 +158,18 @@ export const LLM_PROVIDER_TEMPLATES: LLMProviderTemplate[] = [
     configHint: '模型列表和模型可见性依赖账号权限与 API Key。',
     officialSources: [
       { label: 'OpenRouter Models API', url: 'https://openrouter.ai/docs/api/api-reference/models/get-models' },
+    ],
+  },
+  {
+    channelId: 'requesty',
+    label: 'Requesty',
+    protocol: 'openai',
+    baseUrl: 'https://router.requesty.ai/v1',
+    placeholderModels: 'claude-sonnet-4-6,gpt-5.4',
+    capabilities: ['openai-compatible', 'aggregator', 'model-discovery'],
+    configHint: '模型列表和模型可见性依赖账号权限与 API Key；EU 区域可将 Base URL 改为 https://router.eu.requesty.ai/v1。',
+    officialSources: [
+      { label: 'Requesty Models API', url: 'https://docs.requesty.ai/api-reference/endpoint/models-list' },
     ],
   },
   {

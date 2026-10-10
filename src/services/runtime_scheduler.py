@@ -74,9 +74,17 @@ def _run_scheduled_analysis_process(
             # before analysis can create descendants.
             if os.getsid(0) != os.getpid():
                 raise
+    schedule_args_overrides = dict(schedule_args_overrides)
+    scheduled_for = schedule_args_overrides.pop("_scheduled_for", None)
     service = RuntimeSchedulerService(schedule_args_overrides=schedule_args_overrides)
-    success = service._run_analysis_locked(stock_codes)
-    result_queue.put({"success": success, "error": service._last_error})
+    success = service._run_analysis_locked(
+        stock_codes,
+        scheduled_for=datetime.fromisoformat(scheduled_for) if scheduled_for else None,
+    )
+    result_queue.put({
+        "success": success, "error": service._last_error,
+        "skipped": service._last_skip_reason,
+    })
 
 
 def _posix_descendant_process_ids(root_pid: int) -> Set[int]:
@@ -314,7 +322,11 @@ class RuntimeSchedulerService:
         self._last_skip_reason = "analysis_already_running"
         logger.warning("Runtime scheduler skipped run: analysis already running")
 
-    def _run_analysis_locked(self, stock_codes: Optional[List[str]]) -> bool:
+    def _run_analysis_locked(
+        self, stock_codes: Optional[List[str]], *, scheduled_for: Optional[datetime] = None,
+    ) -> bool:
+        from src.services.scheduled_analysis_claim import ScheduledAnalysisSkipped
+
         try:
             config = self._reload_config()
             runner = self._task_runner
@@ -323,11 +335,19 @@ class RuntimeSchedulerService:
 
                 runner = run_scheduled_analysis
             self._last_run_at = datetime.now().isoformat()
-            result = runner(config, self._make_schedule_args(), stock_codes)
+            args = self._make_schedule_args()
+            args._scheduled_for = scheduled_for
+            result = runner(config, args, stock_codes)
             if result is False:
                 raise RuntimeError("runtime scheduled analysis reported failure")
             self._last_success_at = datetime.now().isoformat()
             self._last_error = None
+            return True
+        except ScheduledAnalysisSkipped:
+            self._last_skipped_at = datetime.now().isoformat()
+            self._last_skip_reason = "scheduled_occurrence_already_claimed"
+            self._last_error = None
+            logger.info("Runtime scheduler skipped already claimed occurrence %s", scheduled_for)
             return True
         except Exception as exc:  # noqa: BLE001 - scheduled runs must not kill API process.
             self._last_error = str(exc)
@@ -359,12 +379,114 @@ class RuntimeSchedulerService:
             )
             return DEFAULT_RUNTIME_SCHEDULER_TIMEOUT_SECONDS
 
+    def _build_timeout_last_error(
+        self,
+        *,
+        timeout_seconds: int,
+        run_started_at: datetime,
+        stock_codes: Optional[List[str]],
+    ) -> str:
+        """Collect partial DB results and build a structured timeout error.
+
+        Notify-channel failures are fail-open and do not change this string.
+        Collect/import failures are also fail-open: this may return a
+        ``completed=0`` structured message (indistinguishable from no saved
+        rows) or, if the helper itself raises, the baseline timeout fallback.
+        ``status().last_error`` therefore cannot be used as a collect-failure
+        signal; grep ``Failed to collect completed analyses after timeout``
+        or ``Timeout partial delivery failed open``.
+        """
+        fallback = f"runtime scheduled analysis timed out after {timeout_seconds}s"
+        try:
+            from src.services.analysis_timeout_partial import handle_runtime_analysis_timeout
+
+            config = None
+            try:
+                config = self._config_provider()
+            except Exception as exc:  # noqa: BLE001 - config is optional for diagnostics
+                logger.warning("Timeout partial notify could not load config: %s", exc)
+
+            no_notify = bool(getattr(self._make_schedule_args(), "no_notify", False))
+            outcome = handle_runtime_analysis_timeout(
+                timeout_seconds=timeout_seconds,
+                run_started_at=run_started_at,
+                stock_codes=stock_codes,
+                no_notify=no_notify,
+                config=config,
+            )
+            if outcome.notified:
+                logger.info(
+                    "Timeout partial notification sent: completed=%s pending=%s",
+                    len(outcome.completed),
+                    len(outcome.pending_codes),
+                )
+            elif outcome.notify_skipped_reason:
+                logger.info(
+                    "Timeout partial notification skipped (%s): completed=%s pending=%s",
+                    outcome.notify_skipped_reason,
+                    len(outcome.completed),
+                    len(outcome.pending_codes),
+                )
+            return outcome.error_message or fallback
+        except Exception as exc:  # noqa: BLE001 - never lose the original timeout signal
+            logger.warning("Timeout partial delivery failed open: %s", exc)
+            return fallback
+
+    def _apply_timeout_partial_outcome(self, context: Dict[str, Any]) -> None:
+        """Enrich timeout diagnostics after the run lock is released.
+
+        Runs in a daemon thread so DB/import work cannot delay the next run or
+        keep the watchdog finally block occupied.
+
+        Consistency with ``status()``:
+        - The watchdog first writes a baseline ``timed out after Ns`` string
+          under ``_analysis_process_lock``, then releases ``_run_lock``.
+        - This thread later replaces ``_last_error`` with the structured
+          completed/pending message, still under ``_analysis_process_lock``.
+        - The replace is skipped if ``generation`` no longer matches (a newer
+          run started) or if ``_last_error`` no longer contains
+          ``timed out after`` (another outcome already replaced it).
+        - ``status()`` reads ``_last_error`` without that lock. CPython
+          pointer assignment is atomic, so callers observe either the baseline
+          or the fully replaced string—never a torn mix. They may briefly see
+          the baseline until this thread finishes.
+        - Notify-channel exceptions stay inside this thread and cannot
+          re-acquire ``_run_lock``. Collect/import fail-open is only visible
+          in warning logs, not as a distinct ``last_error`` code.
+        """
+        generation = context.get("generation")
+
+        def _enrich() -> None:
+            try:
+                enriched = self._build_timeout_last_error(
+                    timeout_seconds=int(context["timeout_seconds"]),
+                    run_started_at=context["run_started_at"],
+                    stock_codes=context.get("stock_codes"),
+                )
+            except Exception as exc:  # noqa: BLE001 - baseline timeout error remains
+                logger.warning("Timeout partial enrichment failed open: %s", exc)
+                return
+            with self._analysis_process_lock:
+                if generation is not None and generation != self._analysis_generation:
+                    return
+                current = self._last_error or ""
+                if "timed out after" not in current:
+                    return
+                self._last_error = enriched
+
+        threading.Thread(
+            target=_enrich,
+            daemon=True,
+            name="runtime-timeout-partial",
+        ).start()
+
     def _run_analysis_with_watchdog(
         self,
         stock_codes: Optional[List[str]] = None,
         *,
         lock_held: bool = False,
         generation: Optional[int] = None,
+        scheduled_for: Optional[datetime] = None,
     ) -> None:
         if not lock_held and not self._run_lock.acquire(blocking=False):
             self._record_analysis_busy_skip()
@@ -374,21 +496,26 @@ class RuntimeSchedulerService:
                 generation = self._analysis_generation
 
         result_queue = None
+        timeout_partial_context: Optional[Dict[str, Any]] = None
         try:
             context = multiprocessing.get_context("spawn")
             result_queue = context.Queue()
+            overrides = dict(self._schedule_args_overrides)
+            if scheduled_for is not None:
+                overrides["_scheduled_for"] = scheduled_for.isoformat()
             process = context.Process(
                 target=self._analysis_process_target,
-                args=(result_queue, stock_codes, dict(self._schedule_args_overrides)),
+                args=(result_queue, stock_codes, overrides),
                 name="runtime-scheduled-analysis",
             )
             timeout = self._analysis_timeout_seconds()
+            run_started_at = datetime.now()
             with self._analysis_process_lock:
                 if generation != self._analysis_generation:
                     return
                 process.start()
                 self._analysis_process = process
-                self._last_run_at = datetime.now().isoformat()
+                self._last_run_at = run_started_at.isoformat()
 
             result = None
             deadline = time.monotonic() + timeout
@@ -411,7 +538,16 @@ class RuntimeSchedulerService:
                 with self._analysis_process_lock:
                     if generation != self._analysis_generation:
                         return
-                    self._last_error = f"runtime scheduled analysis timed out after {timeout}s"
+                    # Baseline error first so status.running can clear quickly.
+                    self._last_error = (
+                        f"runtime scheduled analysis timed out after {timeout}s"
+                    )
+                    timeout_partial_context = {
+                        "timeout_seconds": timeout,
+                        "run_started_at": run_started_at,
+                        "stock_codes": stock_codes,
+                        "generation": generation,
+                    }
                 return
 
             if result is None:
@@ -438,7 +574,11 @@ class RuntimeSchedulerService:
             with self._analysis_process_lock:
                 if generation != self._analysis_generation:
                     return
-                if result.get("success"):
+                if result.get("skipped"):
+                    self._last_skipped_at = datetime.now().isoformat()
+                    self._last_skip_reason = result["skipped"]
+                    self._last_error = None
+                elif result.get("success"):
                     self._last_success_at = datetime.now().isoformat()
                     self._last_error = None
                 else:
@@ -457,12 +597,15 @@ class RuntimeSchedulerService:
             if result_queue is not None:
                 result_queue.cancel_join_thread()
                 result_queue.close()
+            if timeout_partial_context is not None:
+                self._apply_timeout_partial_outcome(timeout_partial_context)
 
     def _start_analysis_watchdog(
         self,
         stock_codes: Optional[List[str]] = None,
         *,
         generation: Optional[int] = None,
+        scheduled_for: Optional[datetime] = None,
     ) -> bool:
         with self._analysis_process_lock:
             current_generation = self._analysis_generation
@@ -477,6 +620,7 @@ class RuntimeSchedulerService:
                 stock_codes,
                 lock_held=True,
                 generation=generation,
+                scheduled_for=scheduled_for,
             ),
             daemon=True,
             name="runtime-scheduler-watchdog",
@@ -577,6 +721,7 @@ class RuntimeSchedulerService:
                 schedule_times=times,
                 schedule_times_provider=self._current_times,
                 register_signals=False,
+                pass_scheduled_for=True,
             )
             if run_immediately and self._run_immediately_in_background:
                 scheduler.set_daily_task(scheduled_analysis, run_immediately=False)
@@ -644,6 +789,23 @@ class RuntimeSchedulerService:
             }
         return {"accepted": True, "running": True}
 
+    def is_background_task_active(self, name: str) -> bool:
+        """Return whether a named task is registered on the live scheduler."""
+        with self._lock:
+            scheduler = self._scheduler
+            thread = self._thread
+            if (
+                not self._enabled
+                or scheduler is None
+                or thread is None
+                or not thread.is_alive()
+            ):
+                return False
+            return any(
+                str(entry.get("name") or "") == name
+                for entry in getattr(scheduler, "_background_tasks", [])
+            )
+
     def status(self) -> Dict[str, Any]:
         scheduler = self._scheduler
         jobs = scheduler.schedule.get_jobs() if scheduler is not None else []
@@ -665,6 +827,8 @@ class RuntimeSchedulerService:
             "next_run_at": next_run,
             "last_run_at": self._last_run_at,
             "last_success_at": self._last_success_at,
+            # Unlocked read: may briefly show the baseline timeout string
+            # until _apply_timeout_partial_outcome finishes. See that method.
             "last_error": self._last_error,
             "last_skipped_at": self._last_skipped_at,
             "last_skip_reason": self._last_skip_reason,
